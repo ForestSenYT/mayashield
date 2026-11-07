@@ -3,3 +3,4 @@ test/
 dist/
 installer/
 archive/
+.vscode/
