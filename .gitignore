@@ -1,6 +1,31 @@
-.remember/
-test/
-dist/
-installer/
-archive/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build and packaging output
+/build/
+/dist/
+
+# Local editor and project data
 .vscode/
+.remember/
+.tests/
+archive/
+installer/
+
+# OS metadata
+.DS_Store
+Thumbs.db
