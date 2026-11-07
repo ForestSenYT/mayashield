@@ -22,7 +22,7 @@ env/
 # Local editor and project data
 .vscode/
 .remember/
-.tests/
+tests/
 archive/
 installer/
 
