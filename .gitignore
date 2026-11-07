@@ -24,7 +24,6 @@ env/
 .remember/
 tests/
 archive/
-installer/
 
 # OS metadata
 .DS_Store

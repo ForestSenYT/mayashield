@@ -8,16 +8,19 @@
 
 1. 安装程序列出检测到的 Maya（从注册表和磁盘查找，会排除已卸载的残留记录）。
 2. 勾选版本后点“安装”，请先关闭 Maya。默认装进 Maya 安装目录，供所有用户使用，会弹一次管理员授权。不想授权可以选“仅当前用户”。
-3. 下次启动 Maya 会自动加载，插件管理器里 Auto load 已勾选。没启动过的 Maya 版本，以及同一台电脑上的其他 Windows 用户，会在第一次启动时自动开启。
+3. 安装完成后进度条走满，安装程序会自动退出；出错时窗口保留，显示原因和日志。
+4. 下次启动 Maya 会自动加载，插件管理器里 Auto load 已勾选。没启动过的 Maya 版本，以及同一台电脑上的其他 Windows 用户，会在第一次启动时自动开启。
 
 旧版本（包括手动放在 `bin/plug-ins` 里的 v3）会被自动移到 `modules/MayaShield.legacy-backup`，它们不移走的话会抢先加载。卸载可以在安装程序里点“卸载”，或用 Windows 的“应用和功能”。隔离区的文件卸载后仍然保留。
+
+安装程序的界面语言跟随 Windows 显示语言：中文系统显示中文，其他系统显示英文，也可以用 `--lang zh` 或 `--lang en` 指定。
 
 安装程序没有代码签名，Windows 可能提示“未知发布者”。
 
 批量部署可以用静默模式：
 
 ```
-MayaShield-4.0.0-Setup.exe --silent [--scope machine|user] [--versions 2024,2025] [--log install.log]
+MayaShield-4.0.0-Setup.exe --silent [--scope machine|user] [--versions 2024,2025] [--log install.log] [--lang zh|en]
 MayaShield-4.0.0-Setup.exe --uninstall --silent
 ```
 
@@ -103,3 +106,7 @@ python tests/corpus_check.py <场景文件夹>               # 误报和速度�
 ```
 
 代码必须保持 Python 3.7 语法（Maya 2022）。不能运行 Maya 的模块（`rules`、`analyzer`、解析器、`scanner`、`cleaner`、`persistence`、`pool`）不要 `import maya`。
+
+## 许可证
+
+[MIT](LICENSE)
