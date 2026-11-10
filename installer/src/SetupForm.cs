@@ -375,10 +375,14 @@ namespace MayaShieldSetup
             o.Scope = machineRadio.Checked ? "machine" : "user";
             if (!o.Machine)
             {
-                MayaInstall blocked = targets.FirstOrDefault(m => m.OldCopy);
-                if (blocked != null)
+                MayaInstall old = targets.FirstOrDefault(m => m.OldCopy);
+                MayaInstall shared = targets.FirstOrDefault(m => Engine.HasMachineCopy(m));
+                if (old != null || shared != null)
                 {
-                    MessageBox.Show(this, L.T("oldNeedsAdmin", blocked.Version), Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    string why = old != null ? L.T("oldNeedsAdmin", old.Version)
+                                             : L.T("machineCopyWins", shared.Version, shared.Installed ?? "?");
+                    MessageBox.Show(this, why, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    ShowCustom(true);
                     return;
                 }
             }

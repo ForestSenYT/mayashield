@@ -85,6 +85,22 @@ def select_node(node):
         om.MGlobal.displayWarning(tr("node.missing", node))
 
 
+def _emphasised(font, larger=0.0):
+    """A bold copy of a font, optionally larger by a factor.
+
+    Maya sizes its interface font in pixels, where pointSize() is -1: adding to that
+    gives a font one point high.  So the size is scaled in whichever unit it is set.
+    """
+    result = QtGui.QFont(font)
+    result.setBold(True)
+    if larger:
+        if font.pointSizeF() > 0:
+            result.setPointSizeF(font.pointSizeF() * (1.0 + larger))
+        elif font.pixelSize() > 0:
+            result.setPixelSize(int(round(font.pixelSize() * (1.0 + larger))))
+    return result
+
+
 class _Worker(QtCore.QThread):
     """Runs one function off the UI thread.  Results come back as signals."""
     progressed = QtCore.Signal(str, int, int)
@@ -150,10 +166,7 @@ class MayaShieldWindow(QtWidgets.QWidget):
         text = QtWidgets.QVBoxLayout()
         text.setSpacing(0)
         self.status_title = QtWidgets.QLabel()
-        title_font = self.status_title.font()
-        title_font.setBold(True)
-        title_font.setPointSize(title_font.pointSize() + 2)
-        self.status_title.setFont(title_font)
+        self.status_title.setFont(_emphasised(self.status_title.font(), 0.2))
         self.status_detail = QtWidgets.QLabel()
         self.status_detail.setWordWrap(True)
         self.status_detail.setStyleSheet("color: #9aa0a6;")
@@ -170,10 +183,7 @@ class MayaShieldWindow(QtWidgets.QWidget):
         # ---- the one button
         self.btn_checkup = self._action(tr("checkup"), self.start_checkup)
         self.btn_checkup.setMinimumHeight(46)
-        big = self.btn_checkup.font()
-        big.setBold(True)
-        big.setPointSize(big.pointSize() + 3)
-        self.btn_checkup.setFont(big)
+        self.btn_checkup.setFont(_emphasised(self.btn_checkup.font(), 0.35))
         self.btn_checkup.setStyleSheet(
             "QPushButton { background-color: #3d7edb; color: white; border: none; border-radius: 5px; }"
             "QPushButton:hover { background-color: #4c8dea; }"
@@ -214,10 +224,7 @@ class MayaShieldWindow(QtWidgets.QWidget):
         banner_text = QtWidgets.QVBoxLayout()
         banner_text.setSpacing(2)
         self.banner_title = QtWidgets.QLabel()
-        headline = self.banner_title.font()
-        headline.setBold(True)
-        headline.setPointSize(headline.pointSize() + 1)
-        self.banner_title.setFont(headline)
+        self.banner_title.setFont(_emphasised(self.banner_title.font(), 0.1))
         self.banner_title.setWordWrap(True)
         self.banner_detail = QtWidgets.QLabel()
         self.banner_detail.setWordWrap(True)
@@ -239,9 +246,11 @@ class MayaShieldWindow(QtWidgets.QWidget):
         self.tree.setHeaderLabels([tr("col.what"), tr("col.where"), tr("col.level")])
         header = self.tree.header()
         header.setStretchLastSection(False)
+        # What is wrong gets the room; where it is can be widened by hand and is in the tooltip in full.
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Interactive)
         header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        self.tree.setColumnWidth(1, 150)
         self.tree.setAlternatingRowColors(True)
         self.tree.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.tree.setMinimumHeight(90)
@@ -852,7 +861,7 @@ class MayaShieldWindow(QtWidgets.QWidget):
             self._banner("review", tr("result.review", len(review)), tr("result.review.detail"),
                          tr("fix.files") if self.chk_medium.isChecked() else None)
         elif canceled:
-            self._banner("idle", tr("result.canceled"), report.get("note", ""))
+            self._banner("idle", tr("result.canceled"), "")
         else:
             self._banner("good", tr("result.clean"), tr("result.clean.files", len(results)))
         self._fill_tree_scene(results)
@@ -937,9 +946,15 @@ class MayaShieldWindow(QtWidgets.QWidget):
         elif report.get("cleaned"):
             self._banner("bad", tr("result.fixed.partial", len(report.get("removed", ())),
                                    report.get("remaining_hits_count", 0)), " ".join(detail))
+        elif report.get("dry_run") and report.get("removed"):
+            self._banner("idle", tr("clean.preview.result", len(report["removed"])), tr("clean.preview"))
+        elif "failed" in str(report.get("note", "")).lower() or "stopped" in str(report.get("note", "")).lower() \
+                or "aborted" in str(report.get("note", "")).lower():
+            self._banner("error", tr("clean.failed"), report.get("note", ""))
+        elif report.get("remaining_hits_count"):
+            self._banner("review", tr("clean.cannot"), "")
         else:
-            self._banner("idle" if not report.get("hits") or report.get("dry_run") else "review",
-                         report.get("note", ""), "")
+            self._banner("good", tr("clean.nothing"), "")
         self._fill_tree_scene([report])
         self._rendered = (self._fill_tree_scene, [report])
 
@@ -1239,9 +1254,24 @@ def _show_pending(window):
         window.show_file_report(reports[-1])
 
 
+_quit_hooked = False
+
+
+def _hook_quit():
+    """A job still running when Maya quits is given a moment to stop first."""
+    global _quit_hooked
+    if _quit_hooked:
+        return
+    application = QtWidgets.QApplication.instance()
+    if application is not None:
+        application.aboutToQuit.connect(lambda: wait_for_jobs(3000))
+        _quit_hooked = True
+
+
 def show_ui(workspace=True, checkup=False):
     """Show the panel, reusing it if it already exists."""
     global _window
+    _hook_quit()
     if workspace:
         if cmds.workspaceControl(WORKSPACE_CONTROL, exists=True):
             cmds.workspaceControl(WORKSPACE_CONTROL, edit=True, visible=True, restore=True)

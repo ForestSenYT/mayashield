@@ -31,8 +31,11 @@ OPT_RUNTIME = "mayashield_runtimeSceneGuardEnabled"
 OPT_MAX_MB = "mayashield_guardMaxMB"
 DEFAULT_MAX_MB = 4096
 # Maya waits for the check before it opens a file.  A scan that has not finished by
-# then is stopped and the file treated as one that could not be fully checked.
+# then is stopped and the file treated as one that could not be fully checked.  The
+# time allowed grows with the file: a very large rig takes a while, and must not be
+# met with a warning for being large.
 SCAN_SECONDS = 30.0
+SCAN_SECONDS_PER_MB = 1.0
 
 _DEBOUNCE_SECONDS = 3.0
 _REFUSAL_QUIET_SECONDS = 20.0
@@ -183,7 +186,8 @@ def _decide(path, operation, progress=None):
         # loaded separately.  The answer just given stands; asking again later is fine.
         return False
 
-    report = scanner.scan_script_file(path) if is_script else scanner.scan_file(path, time_limit=SCAN_SECONDS)
+    report = scanner.scan_script_file(path) if is_script else scanner.scan_file(
+        path, time_limit=SCAN_SECONDS + SCAN_SECONDS_PER_MB * stat.st_size / 1048576.0)
     score = report.get("score", 0)
     # A file that defeats the scanner has not been shown to be safe.
     unverified = not report.get("parse_ok", True) or any(

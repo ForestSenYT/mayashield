@@ -28,6 +28,8 @@ _ARGS_WINDOW = 8192
 
 _STRING_RE = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"', re.S)
 _SPACE_RE = re.compile(rb"\s*")
+_SHORT_STATEMENT = 256
+_NEEDS_CARE_RE = re.compile(rb"[\\/`$(]")   # what makes a statement more than plain words and simple strings
 _COMMAND_RE = re.compile(rb"[^\s;(\"`]+")
 _ARG_RE = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"|[^\s;]+', re.S)
 _CODESET_RE = re.compile(rb"^//\s*Codeset:\s*(\S+)", re.I | re.M)
@@ -46,6 +48,7 @@ _NODE_OWNED = (b"rename", b"lockNode", b"deleteAttr", b"aliasAttr", b"instanceab
 _LINK_COMMANDS = (b"connectAttr", b"disconnectAttr", b"relationship", b"parent")
 _NORMAL_FILE_FLAGS = (b"-r", b"-rdi", b"-reference")
 _TYPE_FLAGS = (b"-type", b"-typ")
+_NAME_FLAGS = (b"-ln", b"-longName", b"-sn", b"-shortName")
 _SCRIPT_NUMBERS = ("st", "stp", "scriptType", "sourceType")
 
 
@@ -112,13 +115,19 @@ def iter_statements(data):
     """
     size = len(data)
     find = data.find
+    skip_space = _SPACE_RE.match
     pos = 3 if data[:3] == b"\xef\xbb\xbf" else 0
     next_semicolon = next_quote = next_slash = next_backtick = next_dollar = next_paren = -1
     while True:
-        pos = _skip_gap(data, pos, size)
+        pos = skip_space(data, pos).end()
         if pos >= size:
             return
         first_byte = data[pos]
+        if first_byte == _SLASH:   # perhaps a comment
+            pos = _skip_gap(data, pos, size)
+            if pos >= size:
+                return
+            first_byte = data[pos]
         if first_byte == _SEMICOLON:  # an empty statement
             pos += 1
             continue
@@ -135,6 +144,26 @@ def iter_statements(data):
         statement = Statement(match.group(0) if match else data[pos:pos + 1], pos)
         statement.end = size
         cursor = match.end() if match else pos + 1
+
+        # Most statements in a scene are short and plain: `rename -uid "..."`, `setAttr ".t" 1 2 3`.
+        # When the text up to the next semicolon has no escape, comment, backtick, dollar sign or
+        # parenthesis, and its quotes pair up, that semicolon ends the statement and the quoted
+        # pieces are its literals: no need to walk it one special character at a time.
+        if next_semicolon < cursor:
+            next_semicolon = find(b";", cursor)
+            if next_semicolon < 0:
+                next_semicolon = size
+        if next_semicolon < size and next_semicolon - cursor <= _SHORT_STATEMENT:
+            body = data[cursor:next_semicolon]
+            if not _NEEDS_CARE_RE.search(body):
+                pieces = body.split(b'"')
+                if len(pieces) % 2:   # an even number of quotes
+                    statement.literals = pieces[1::2]
+                    statement.end = next_semicolon + 1
+                    yield statement
+                    pos = statement.end
+                    continue
+
         while True:
             if next_semicolon < cursor:
                 next_semicolon = find(b";", cursor)
@@ -245,13 +274,6 @@ def plug_node(reference):
     """Node name from a plug reference such as ':ns:a.tx' or '|grp|a.tx'."""
     head = reference.split(".", 1)[0]
     return head.rsplit("|", 1)[-1].lstrip(":")
-
-
-def _flag_value(args, *flags):
-    for index, token in enumerate(args[:-1]):
-        if token in flags:
-            return args[index + 1].strip(b'"')
-    return None
 
 
 def _parse_create_node(args):
@@ -434,8 +456,12 @@ class _SceneBuilder(object):
             return
         self.own(extent)
         args = self.args_of(statement)
-        for flag in (b"-ln", b"-longName", b"-sn", b"-shortName"):
-            value = _flag_value(args, flag)
+        found = {}
+        for index in range(len(args) - 1):
+            if args[index] in _NAME_FLAGS and args[index] not in found:
+                found[args[index]] = args[index + 1].strip(b'"')
+        for flag in _NAME_FLAGS:
+            value = found.get(flag)
             if value:
                 self.current.attr_extents.setdefault(value.decode("latin-1"), []).append(extent)
 

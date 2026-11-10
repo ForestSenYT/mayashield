@@ -14,7 +14,9 @@ STATUS_BUTTON = "MayaShieldStatusBtn"
 SHELF_NAME = "MayaShield"
 PREFS_WINDOW = "MayaShieldPrefsWin"
 
-OPT_DRYRUN = "mayashield_dryRun"
+# A new name in 4.1: the 4.0 panel saved "dry run" as on for everybody, and that old value
+# must not make the new panel's tools start out in preview mode.
+OPT_DRYRUN = "mayashield_previewOnly"
 OPT_VERBOSE = "mayashield_verbose"
 OPT_REPORT = "mayashield_reportPath"
 
@@ -31,6 +33,14 @@ _SHELF_BUTTONS = (
 # 4.0 also had a "Clean" button that worked on files without showing what it found.
 # The panel's "Fix Now" replaces it.
 _RETIRED_SHELF_ANNOTATIONS = ("MayaShield: Clean",)
+
+
+def _maya_global(name):
+    """A MEL global such as $gMainWindow.  The helper variable has a name nobody else
+
+    uses: `$tmp`, declared with another type by some other tool, would make this fail.
+    """
+    return mel.eval("$mayashieldGlobalValue = %s" % name)
 
 
 def _icon():
@@ -51,7 +61,7 @@ def _show_panel(workspace, checkup=False):
 
 
 def install_menu():
-    main_window = mel.eval("$tmp=$gMainWindow")
+    main_window = _maya_global("$gMainWindow")
     if not main_window:
         return False
     uninstall_menu()
@@ -71,7 +81,7 @@ def uninstall_menu():
 
 
 def install_status_button():
-    parent = mel.eval("$tmp=$gStatusLine")
+    parent = _maya_global("$gStatusLine")
     if not parent or cmds.control(STATUS_BUTTON, exists=True):
         return bool(parent)
     try:
@@ -88,7 +98,7 @@ def uninstall_status_button():
 
 
 def install_shelf():
-    top = mel.eval("$tmp=$gShelfTopLevel")
+    top = _maya_global("$gShelfTopLevel")
     if not top:
         return False
     if not cmds.shelfLayout(SHELF_NAME, exists=True):
@@ -150,5 +160,6 @@ def uninstall_all():
     try:
         from . import ui
         ui.close_ui()
+        ui.wait_for_jobs()   # nothing of ours may still be running when the plug-in is gone
     except Exception:
         pass

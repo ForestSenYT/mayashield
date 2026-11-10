@@ -31,6 +31,14 @@ def main(argv=None):
     if not args.command:
         parser.print_help()
         return 2
+    if not os.path.exists(args.path):
+        print("No such file or folder: %s" % args.path)
+        return 2
+    try:
+        # A path or node name the console's code page cannot show must not stop the listing.
+        sys.stdout.reconfigure(errors="backslashreplace")
+    except (AttributeError, ValueError):
+        pass
 
     is_folder = os.path.isdir(args.path)
     if args.command == "scan":

@@ -706,6 +706,8 @@ def analyze_attr(text):
             out.add("hidden_payload", "obfuscation", 25, "executable code stored in a data attribute")
     elif len(text) >= 256:
         _analyze_blobs(text, out, CONTEXT_ATTR, 0, _Budget())
+    if not out.items and not out.families:   # the usual case by far: a name, a path, a note
+        return {"score": 0, "evidence": [], "families": []}
     _apply_combos(out)
     return _finish(out, CONTEXT_ATTR)
 

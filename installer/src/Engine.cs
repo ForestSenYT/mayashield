@@ -122,10 +122,21 @@ namespace MayaShieldSetup
 
             if (!o.Machine)
             {
-                List<MayaInstall> blocked = targets.Where(m => m.OldCopy).ToList();
-                foreach (MayaInstall maya in blocked)
-                    report.Log(L.T("oldNeedsAdmin", maya.Version));
-                if (blocked.Count > 0)
+                // Maya looks in its own modules folder first and takes the first MayaShield it finds
+                // there, whatever its version (checked in Maya 2026).  A copy in the user's folder
+                // would be installed and then never used.
+                bool blocked = false;
+                foreach (MayaInstall maya in targets)
+                {
+                    if (maya.OldCopy)
+                        report.Log(L.T("oldNeedsAdmin", maya.Version));
+                    else if (HasMachineCopy(maya))
+                        report.Log(L.T("machineCopyWins", maya.Version, Maya.InstalledVersion(Path.Combine(maya.Path, "modules")) ?? "?"));
+                    else
+                        continue;
+                    blocked = true;
+                }
+                if (blocked)
                     return Exit.OldNeedsAdmin;
             }
 
@@ -200,6 +211,13 @@ namespace MayaShieldSetup
             if (failed)
                 return Exit.Error;
             return verified ? Exit.Ok : Exit.SelfTestFailed;
+        }
+
+        /// <summary>Is there a MayaShield in this Maya's own modules folder, the one that serves every user?</summary>
+        public static bool HasMachineCopy(MayaInstall maya)
+        {
+            string modules = Path.Combine(maya.Path, "modules");
+            return File.Exists(Path.Combine(modules, ModFile)) || Directory.Exists(Path.Combine(modules, ModuleName));
         }
 
         bool NeedsAdmin(IEnumerable<MayaInstall> targets)
@@ -329,7 +347,7 @@ namespace MayaShieldSetup
                 }
             }
 
-            // An all-users install replaces this user's own copy, which would otherwise win.
+            // An all-users install makes this user's own copy dead weight: Maya uses the one in its own folder.
             if (o.Machine)
             {
                 foreach (string versionDir in versionDirs)

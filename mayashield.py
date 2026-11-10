@@ -18,18 +18,33 @@ def maya_useNewAPI():
 
 
 def _ensure_engine_importable():
-    try:
-        import mayashield_core  # noqa: F401
-        return
-    except ImportError:
-        pass
+    """Make ``import mayashield_core`` find the engine that came with this very file.
+
+    Two copies of MayaShield can be on one machine (one for everybody in Maya's own
+    folder, one in a user's).  Maya then puts the scripts folder of one on sys.path
+    and may load the plug-in file of the other; an engine of a different version
+    than the plug-in file fails in ways nobody can make sense of.  So the engine
+    next to this file goes first, whatever else is on the path.
+    """
     # Maya's plug-in loader doesn't define __file__, but the code object knows.
     here = os.path.dirname(os.path.abspath(_ensure_engine_importable.__code__.co_filename))
-    for folder in (here, os.path.join(os.path.dirname(here), "scripts")):
+    for folder in (os.path.join(os.path.dirname(here), "scripts"), here):
         if os.path.isdir(os.path.join(folder, "mayashield_core")):
+            loaded = sys.modules.get("mayashield_core")
+            origin = os.path.dirname(os.path.dirname(os.path.abspath(getattr(loaded, "__file__", "") or ""))) if loaded else ""
+            if loaded is not None and os.path.normcase(origin) != os.path.normcase(folder):
+                # Another copy's engine is already imported (its userSetup guard, say).  Drop it,
+                # so that what gets imported from here on is all of one version.
+                for name in [name for name in sys.modules if name == "mayashield_core" or name.startswith("mayashield_core.")]:
+                    del sys.modules[name]
+            while folder in sys.path:
+                sys.path.remove(folder)
             sys.path.insert(0, folder)
             return
-    raise RuntimeError("MayaShield: the mayashield_core package was not found. Please reinstall MayaShield.")
+    try:
+        import mayashield_core  # noqa: F401
+    except ImportError:
+        raise RuntimeError("MayaShield: the mayashield_core package was not found. Please reinstall MayaShield.")
 
 
 def initializePlugin(mobject):
