@@ -13,7 +13,7 @@ import os
 import subprocess
 import sys
 import time
-from urllib.parse import parse_qs, quote, unquote
+from urllib.parse import parse_qs, quote
 
 import maya.api.OpenMaya as om
 import maya.cmds as cmds
@@ -33,18 +33,32 @@ _MAX_RENDERED = 300
 _LEVEL_ROLE = QtCore.Qt.UserRole + 1
 
 _window = None
+_threads = set()   # running jobs: they belong to no window, so closing one cannot destroy a running thread
 
 
 def _link(action, value):
-    return "%s%s?v=%s" % (_LINK_SCHEME, action, quote(str(value)))
+    return "%s%s?v=%s" % (_LINK_SCHEME, action, quote(str(value), safe=""))
 
 
 def _parse_link(url):
+    """(action, value) of a link made by _link.  The action comes back lower-case:
+
+    Qt treats it as a host name and lower-cases it on the way through a QUrl.
+    """
     text = str(url)
-    if not text.startswith(_LINK_SCHEME) or "?" not in text:
+    if not text.lower().startswith(_LINK_SCHEME) or "?" not in text:
         return None, None
     action, query = text[len(_LINK_SCHEME):].split("?", 1)
-    return action, unquote(parse_qs(query).get("v", [""])[0])
+    return action.strip("/").lower(), parse_qs(query, keep_blank_values=True).get("v", [""])[0]
+
+
+def _follow_link(link):
+    action, value = _parse_link(link)
+    if action == "reveal":
+        reveal_path(value)
+    elif action == "selectnode":
+        select_node(value)
+    return action
 
 
 def reveal_path(path):
@@ -77,10 +91,18 @@ class _Worker(QtCore.QThread):
     done = QtCore.Signal(object)
     failed = QtCore.Signal(str)
 
-    def __init__(self, function, parent=None):
-        super(_Worker, self).__init__(parent)
+    def __init__(self, function):
+        # No parent: Qt aborts the whole program if a thread is destroyed while it runs,
+        # and a panel can be closed, re-docked or deleted at any moment.
+        super(_Worker, self).__init__()
         self.function = function
         self.canceled = False
+        _threads.add(self)
+        self.finished.connect(self._retire)
+
+    def _retire(self):
+        _threads.discard(self)
+        self.deleteLater()
 
     def cancel(self):
         self.canceled = True
@@ -430,11 +452,7 @@ class MayaShieldWindow(QtWidgets.QWidget):
             self.le_report.setText(path)
 
     def _on_log_link(self, url):
-        action, value = _parse_link(url.toString())
-        if action == "reveal":
-            reveal_path(value)
-        elif action == "selectNode":
-            select_node(value)
+        _follow_link(url.toString())
 
     def _css_color(self, level):
         red, green, blue = _RISK_COLORS.get(str(level or ""), (150, 150, 150))
@@ -447,22 +465,22 @@ class MayaShieldWindow(QtWidgets.QWidget):
                          html.escape(", ".join(str(reason) for reason in reasons))))
 
     # ------------------------------------------------------------------ background jobs
-    def _start_job(self, label, function, on_done):
+    def _start_job(self, label, function, on_done, can_cancel=False):
         if self.worker is not None:
             self._note(tr("busy.other"))
             return False
         self._save_options()
-        worker = _Worker(function, self)
+        worker = _Worker(function)
         self.worker = worker
         self.started = time.time()
-        worker.progressed.connect(self._on_progress)
-        worker.done.connect(lambda result: self._finish_job(on_done, result))
-        worker.failed.connect(self._on_job_failed)
-        worker.finished.connect(worker.deleteLater)
+        # The job may outlive this panel.  Its results are then simply dropped.
+        worker.progressed.connect(lambda *args: is_alive(self) and self._on_progress(*args))
+        worker.done.connect(lambda result: is_alive(self) and self._finish_job(on_done, result))
+        worker.failed.connect(lambda message: is_alive(self) and self._on_job_failed(message))
         self.progress_label.setText(label)
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(True)
-        self.btn_cancel.setVisible(True)
+        self.btn_cancel.setVisible(bool(can_cancel))   # only where stopping really stops something
         self.btn_cancel.setEnabled(True)
         for button in self.action_buttons:
             button.setEnabled(False)
@@ -775,19 +793,21 @@ class MayaShieldWindow(QtWidgets.QWidget):
     def _scan_paths_job(self, target, is_folder):
         deep = self.chk_deep.isChecked()
         timeout = self.sb_timeout.value()
-        mayapy = mayapaths.find_mayapy()
+        interpreter = mayapaths.find_mayapy()
+        # A real Maya only ever opens a file when the deep check was asked for.
+        mayapy = interpreter if deep else None
         report_path = self._report_path()
         self._heading(tr("heading.scan", target))
 
         if is_folder:
             def work(worker):
                 return scanner.scan_folder(target, report_path=report_path, deep=deep, timeout_sec=timeout, mayapy=mayapy,
-                                           interpreter=mayapy, progress_cb=worker.report_progress,
+                                           interpreter=interpreter, progress_cb=worker.report_progress,
                                            cancel_cb=worker.is_canceled)
         else:
             def work(_worker):
                 return scanner.scan_file(target, report_path=report_path, deep=deep, timeout_sec=timeout, mayapy=mayapy)
-        self._start_job(tr("busy.scan"), work, self._show_scene_report)
+        self._start_job(tr("busy.scan"), work, self._show_scene_report, can_cancel=is_folder)
 
     def show_file_report(self, report):
         """Show a report made elsewhere, such as the guard's note about a file it let through."""
@@ -945,7 +965,7 @@ class MayaShieldWindow(QtWidgets.QWidget):
             return cleaner.clean_folder(folder, report_path=report_path, output_root=out_root, in_place=mode == "inplace",
                                         threshold=threshold, timeout_sec=timeout, dry_run=dry_run, interpreter=mayapy,
                                         progress_cb=worker.report_progress, cancel_cb=worker.is_canceled)
-        self._start_job(tr("busy.clean"), work, self._show_folder_clean_report)
+        self._start_job(tr("busy.clean"), work, self._show_folder_clean_report, can_cancel=True)
 
     def _show_folder_clean_report(self, report):
         self.last_kind = None
@@ -1018,7 +1038,7 @@ class MayaShieldWindow(QtWidgets.QWidget):
             self._fill_tree_scene(results)
             self._rendered = (self._fill_tree_scene, results)
             self._write_report(payload)
-        self._start_job(tr("busy.clean"), work, done)
+        self._start_job(tr("busy.clean"), work, done, can_cancel=True)
 
     # ------------------------------------------------------------------ quarantine
     def _show_quarantine(self):
@@ -1145,11 +1165,7 @@ class MayaShieldWindow(QtWidgets.QWidget):
         self._show_tree(shown > 0)
 
     def _on_tree_item(self, item, _column):
-        action, value = _parse_link(item.data(0, QtCore.Qt.UserRole) or "")
-        if action == "reveal":
-            reveal_path(value)
-        elif action == "selectNode":
-            select_node(value)
+        _follow_link(item.data(0, QtCore.Qt.UserRole) or "")
 
     def _on_tree_menu(self, position):
         item = self.tree.itemAt(position)
@@ -1158,7 +1174,7 @@ class MayaShieldWindow(QtWidgets.QWidget):
         menu = QtWidgets.QMenu(self.tree)
         action, value = _parse_link(item.data(0, QtCore.Qt.UserRole) or "")
         reveal = menu.addAction(tr("menu.reveal")) if action == "reveal" else None
-        select = menu.addAction(tr("menu.select")) if action == "selectNode" else None
+        select = menu.addAction(tr("menu.select")) if action == "selectnode" else None
         copy = menu.addAction(tr("menu.copy"))
         menu.addSeparator()
         expand = menu.addAction(tr("menu.expand"))
@@ -1178,9 +1194,9 @@ class MayaShieldWindow(QtWidgets.QWidget):
             QtWidgets.QApplication.clipboard().setText("%s | %s" % (item.text(0), item.toolTip(1) or item.text(1)))
 
     def closeEvent(self, event):
+        # The job is told to stop and left to finish by itself; nothing waits on it here.
         if self.worker is not None:
             self.worker.cancel()
-            self.worker.wait(5000)
         super(MayaShieldWindow, self).closeEvent(event)
 
 
@@ -1256,9 +1272,19 @@ def show_ui(workspace=True, checkup=False):
 
 def close_ui():
     global _window
+    if is_alive(_window) and _window.worker is not None:
+        _window.worker.cancel()
     if cmds.workspaceControl(WORKSPACE_CONTROL, exists=True):
         cmds.deleteUI(WORKSPACE_CONTROL)
     if is_alive(_window):
         _window.close()
         _window.deleteLater()
     _window = None
+
+
+def wait_for_jobs(milliseconds=5000):
+    """Before the plug-in unloads or Maya quits: give running jobs a moment to stop."""
+    for thread in list(_threads):
+        thread.cancel()
+    for thread in list(_threads):
+        thread.wait(milliseconds)

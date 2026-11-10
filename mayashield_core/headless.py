@@ -56,7 +56,12 @@ def deep_scan(path, mayapy, timeout_sec=120):
         detail = completed.stderr.decode("utf-8", "replace").strip()[-500:] or "No report was written."
         return _error_report(target, "noReport", "Deep scan failed: %s" % detail)
     except subprocess.TimeoutExpired:
-        return _error_report(target, "timeout", "Deep scan timed out after %ss." % timeout_sec)
+        # Maya is slow to leave.  If it had already written its findings, they count.
+        try:
+            with open(output, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except (IOError, OSError, ValueError):
+            return _error_report(target, "timeout", "Deep scan timed out after %ss." % timeout_sec)
     except (OSError, ValueError) as error:
         return _error_report(target, "exception", "Deep scan failed: %s" % error)
     finally:

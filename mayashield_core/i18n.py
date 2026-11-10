@@ -291,6 +291,7 @@ TEXT = {
     "st.removed": ("Unloaded", u"已卸载"),
     "st.would_remove": ("Would be unloaded", u"将会卸载"),
     "st.attr": ("Attribute removed", u"已清除属性"),
+    "st.already": ("Already dealt with", u"已经处理过"),
 
     # ---- dialogs raised by the guard
     "btn.block": ("Don't Open (Recommended)", u"不打开（推荐）"),
@@ -338,6 +339,9 @@ TEXT = {
     "guard.batch.unverified": ("UNVERIFIED", u"未能验证"),
     "guard.check.failed": ("MayaShield: the check before opening failed, so the file was allowed: %s",
                            u"MayaShield：打开前的检查出错，已放行该文件：%s"),
+    "guard.check.refused": ("MayaShield: this file looked dangerous and something went wrong while handling it, "
+                            "so it was not opened: %s",
+                            u"MayaShield：这个文件看起来有危险，处理过程中又出了错，所以没有打开它：%s"),
     "guard.runtime.title": ("MayaShield found a problem in this scene", u"MayaShield 在这个场景里发现了问题"),
     "guard.runtime.text": ("Something dangerous is active in this Maya session:\n\n%s\n\nFix it now?",
                            u"本次 Maya 会话里有危险内容正在运行：\n\n%s\n\n现在修复吗？"),
@@ -569,7 +573,8 @@ _STATUS_KEYS = (
     ("would_report", "st.would_report"), ("would_delete", "st.would_delete"), ("would_kill", "st.would_kill"),
     ("would_remove", "st.would_remove"), ("needs manual repair", "st.manual"),
     ("needs administrator rights", "st.admin"), ("repaired", "st.repaired"), ("quarantined", "st.quarantined"),
-    ("attribute removed", "st.attr"), ("deleted", "st.deleted"), ("killed", "st.killed"),
+    ("attribute removed", "st.attr"), ("already clean", "st.already"), ("already gone", "st.already"),
+    ("deleted", "st.deleted"), ("killed", "st.killed"),
     ("removed from", "st.removed"), ("failed", "st.failed"),
 )
 

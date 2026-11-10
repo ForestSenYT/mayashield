@@ -141,8 +141,9 @@ def list_script_jobs():
 
 def _job_entries():
     for line in list_script_jobs():
-        match = re.match(r"^\s*(\d+)\s*:\s*(.*)$", line)
-        yield (int(match.group(1)) if match else None), (match.group(2) if match else line)
+        # Only the number is parsed: a job's own text may run over several lines.
+        match = re.match(r"\s*(\d+)\s*:\s*", line)
+        yield (int(match.group(1)) if match else None), (line[match.end():] if match else line)
 
 
 def job_hits():

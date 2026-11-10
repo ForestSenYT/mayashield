@@ -15,6 +15,7 @@ through the dialogs that matter.
 Batch sessions (render farms) are only warned: no dialog, no refused files.
 """
 import os
+import re
 import threading
 import time
 
@@ -31,11 +32,16 @@ OPT_MAX_MB = "mayashield_guardMaxMB"
 DEFAULT_MAX_MB = 4096
 
 _DEBOUNCE_SECONDS = 3.0
+_REFUSAL_QUIET_SECONDS = 20.0
 _MAX_REVIEWS = 10
+_INSTANCE_SUFFIX_RE = re.compile(r"\{\d+\}$")
 _callbacks = []
-_verdicts = {}             # (path, size, mtime) -> "allow" | "block"
+_verdicts = {}             # (path, size, mtime) -> "allow"
+_refused = {}              # (path, size, mtime) -> when the user last refused it
 _reviews = []              # reports of files let through with a note, newest last
 _last_scene = ("", 0.0)
+_check_pending = False
+_ignored_scene = None      # the scene the user said "Not Now" about
 _startup_checked = False
 
 
@@ -124,7 +130,9 @@ def _note_review(path, report):
 
 def _file_path(file_object):
     path = file_object.resolvedFullName() or file_object.rawFullName()
-    return path.split("{", 1)[0] if path.endswith("}") else path
+    # A second instance of a reference arrives as "rig.ma{1}".  Only that suffix goes:
+    # a folder may have braces in its own name.
+    return _INSTANCE_SUFFIX_RE.sub("", path)
 
 
 _OPERATIONS = {
@@ -134,15 +142,25 @@ _OPERATIONS = {
 
 
 def _check_file(file_object, message_name):
-    """Returns False to make Maya refuse the file.  Must never raise."""
+    """Returns False to make Maya refuse the file.  Must never raise.
+
+    A check that fails before it has a verdict lets the file through: the after-open
+    check is still to come, and a scanner fault must not stop people working.  Once
+    the scan has called the file dangerous, a fault in what follows (the dialog, the
+    clean copy) must not open it.
+    """
+    progress = {"dangerous": False}
     try:
-        return _decide(_file_path(file_object), _OPERATIONS.get(message_name, "open"))
+        return _decide(_file_path(file_object), _OPERATIONS.get(message_name, "open"), progress)
     except Exception as error:
+        if progress["dangerous"] and not _batch():
+            om.MGlobal.displayError(tr("guard.check.refused", error))
+            return False
         om.MGlobal.displayWarning(tr("guard.check.failed", error))
         return True
 
 
-def _decide(path, operation):
+def _decide(path, operation, progress=None):
     if not option_bool(OPT_RUNTIME) or not os.path.isfile(path):
         return True
     # By content as well as name: Maya will open a renamed scene if told its type.
@@ -156,7 +174,11 @@ def _decide(path, operation):
         return True
     key = (os.path.normcase(path), stat.st_size, stat.st_mtime)
     if key in _verdicts:
-        return _verdicts[key] == "allow"
+        return True
+    if time.time() - _refused.get(key, 0.0) < _REFUSAL_QUIET_SECONDS:
+        # The same file again within moments: every instance of a reference asks to be
+        # loaded separately.  The answer just given stands; asking again later is fine.
+        return False
 
     report = scanner.scan_script_file(path) if is_script else scanner.scan_file(path)
     score = report.get("score", 0)
@@ -172,7 +194,11 @@ def _decide(path, operation):
     if _batch():
         om.MGlobal.displayWarning(tr("guard.batch", tr("guard.batch.unverified" if score < rules.RISK_HIGH
                                                          else "guard.batch.high"), path, score, _summary(report)))
+        _verdicts[key] = "allow"   # said once; a render job loads the same reference many times
         return True
+
+    if progress is not None:
+        progress["dangerous"] = True
 
     if score >= rules.RISK_HIGH:
         can_clean = not is_script and report.get("parse_ok", True)
@@ -187,6 +213,7 @@ def _decide(path, operation):
         _verdicts[key] = "allow"
         om.MGlobal.displayWarning(tr("guard.opened", path))
         return True
+    _refused[key] = time.time()
     if choice == "clean_copy":
         result = cleaner.clean_file(path)
         if result.get("cleaned"):
@@ -211,7 +238,18 @@ def _open_scene(path):
 
 
 def _after_scene_change(*_args):
+    """Ask for one check, however many files a scene just pulled in."""
+    global _check_pending
+    if _check_pending:
+        return
+    _check_pending = True
     maya.utils.executeDeferred(after_scene_check)
+
+
+def _after_open(*_args):
+    global _ignored_scene
+    _ignored_scene = None   # a scene opened afresh is asked about afresh
+    _after_scene_change()
 
 
 def _show_panel():
@@ -221,15 +259,17 @@ def _show_panel():
 
 def after_scene_check():
     """Second layer: look at what is actually in the session now."""
-    global _last_scene
+    global _last_scene, _check_pending, _ignored_scene
+    _check_pending = False
     if not option_bool(OPT_RUNTIME):
         return
+    scene = "<untitled>"
     try:
         scene = cmds.file(q=True, sceneName=True) or "<untitled>"
-        now = time.time()
-        if scene == _last_scene[0] and now - _last_scene[1] < _DEBOUNCE_SECONDS:
+        if scene == _last_scene[0] and time.time() - _last_scene[1] < _DEBOUNCE_SECONDS:
             return
-        _last_scene = (scene, now)
+        if scene == _ignored_scene:
+            return
 
         scene_hits = [hit for hit in live.scene_hits() if hit["score"] >= rules.RISK_HIGH]
         job_hits = live.job_hits()
@@ -255,12 +295,19 @@ def after_scene_check():
                                          sum(1 for item in jobs["killed"] if item["status"] == "killed"),
                                          sum(1 for item in nodes["deleted"] if item["status"] == "deleted")))
         elif choice == "open_panel":
+            _ignored_scene = scene   # they are looking at it in the panel: no second dialog on top
             _show_panel()
+        elif choice == "ignore":
+            _ignored_scene = scene
         elif choice == "disable":
             set_option_bool(OPT_RUNTIME, False)
             om.MGlobal.displayWarning(tr("guard.runtime.off"))
     except Exception as error:
         om.MGlobal.displayWarning(tr("guard.runtime.error", error))
+    finally:
+        # Stamped when the check ends: one that took long (a heavy scene, a dialog left
+        # open) must not let the checks queued behind it run all over again.
+        _last_scene = (scene, time.time())
 
 
 def install():
@@ -273,7 +320,8 @@ def install():
     for name in ("kAfterOpen", "kAfterImport", "kAfterCreateReference", "kAfterLoadReference"):
         message = getattr(om.MSceneMessage, name, None)
         if message is not None:
-            _callbacks.append(om.MSceneMessage.addCallback(message, _after_scene_change))
+            handler = _after_open if name == "kAfterOpen" else _after_scene_change
+            _callbacks.append(om.MSceneMessage.addCallback(message, handler))
 
 
 def uninstall():

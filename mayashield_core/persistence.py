@@ -7,15 +7,18 @@ family drops its files), every installed version and language folder, the real
 ``sys.path``, ``Maya.env``, module files, and the localized files under the Maya
 install used by the Mel UI Configuration family.
 """
+import ast
 import datetime
 import hashlib
 import json
 import os
 import re
 import shutil
+import uuid
 
-from . import analyzer, mayapaths, rules
-from .ma_parser import iter_statements
+from . import analyzer, fileops, mayapaths, pyguard, rules
+from .ma_parser import _expand_to_lines, iter_statements
+from .scene_model import merge_ranges
 from .scanner import now
 
 _STARTUP_NAMES = ("usersetup.py", "usersetup.mel", "userprefs.mel", "pluginprefs.mel", "maya.env")
@@ -172,13 +175,32 @@ def _classify(path):
 
 
 def candidate_files(env, scan_all=False):
-    """Files to inspect, each once.  Always includes what Maya runs at startup."""
+    """Files to inspect, each once.  Always includes what Maya runs at startup.
+
+    "Once" means once per file, not once per spelling: a mapped drive and its UNC
+    path, or a junction, lead to the same userSetup.py, and cleaning it twice would
+    repair it and then throw the repaired file away.
+    """
     seen = {}
+    identities = set()
 
     def add(path):
         normalized = os.path.normcase(os.path.normpath(path))
-        if normalized not in seen and os.path.isfile(path):
-            seen[normalized] = os.path.normpath(path)
+        if normalized in seen or not os.path.isfile(path):
+            return
+        try:
+            status = os.stat(path)
+            identity = (status.st_dev, status.st_ino) if status.st_ino else None
+            real = os.path.normcase(os.path.realpath(path))
+        except OSError:
+            identity, real = None, normalized
+        if real in seen or (identity is not None and identity in identities):
+            return
+        if identity is not None:
+            identities.add(identity)
+        seen[normalized] = os.path.normpath(path)
+        if real != normalized:
+            seen[real] = None   # remembered, not listed twice
 
     script_dirs = _script_dirs(env)
     # What Maya itself would execute: every userSetup on these search paths.
@@ -216,34 +238,40 @@ def candidate_files(env, scan_all=False):
                     break
             if truncated:
                 break
-    return list(seen.values()), truncated
+    return [path for path in seen.values() if path is not None], truncated
 
 
 # ---------------------------------------------------------------------------
 # Inspecting one file
 # ---------------------------------------------------------------------------
+def _env_line_evidence(raw, is_mod):
+    """Evidence from one line of a Maya.env or .mod file."""
+    items = []
+    line = raw.strip()
+    if not line or line.startswith(("#", "//")):
+        return items
+    if is_mod:
+        value = line.split(":=", 1)[-1] if ":=" in line else line.rsplit(None, 1)[-1]
+    else:
+        if "=" not in line:
+            return items
+        key, value = [piece.strip() for piece in line.split("=", 1)]
+        if key.upper() == "PYTHONSTARTUP":
+            items.append({"rule": "env_python_startup", "category": "persistence", "weight": 45,
+                          "detail": line[:160]})
+        if key.upper() not in rules.ENV_PATH_KEYS:
+            return items
+    if rules.SUSPICIOUS_PATH_RE.search(value.replace("/", "\\")):
+        items.append({"rule": "env_suspicious_path", "category": "persistence", "weight": 55,
+                      "detail": "Startup path in a throwaway folder: %s" % line[:160]})
+    return items
+
+
 def _env_evidence(text, path):
     items = []
     is_mod = path.lower().endswith(".mod")
     for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith(("#", "//")):
-            continue
-        if is_mod:
-            value = line.split(":=", 1)[-1] if ":=" in line else line.rsplit(None, 1)[-1]
-            key = line
-        else:
-            if "=" not in line:
-                continue
-            key, value = [piece.strip() for piece in line.split("=", 1)]
-            if key.upper() == "PYTHONSTARTUP":
-                items.append({"rule": "env_python_startup", "category": "persistence", "weight": 45,
-                              "detail": line[:160]})
-            if key.upper() not in rules.ENV_PATH_KEYS:
-                continue
-        if rules.SUSPICIOUS_PATH_RE.search(value.replace("/", "\\")):
-            items.append({"rule": "env_suspicious_path", "category": "persistence", "weight": 55,
-                          "detail": "Startup path in a throwaway folder: %s" % line[:160]})
+        items.extend(_env_line_evidence(raw, is_mod))
     return items
 
 
@@ -265,6 +293,28 @@ def _manifest_verdict(path):
     if expected is None:
         return "foreign"
     return "own" if sha256_file(target) == expected else "tampered"
+
+
+def _analyze_content(path, data, context, notes):
+    """Analyses of a startup or tool file's bytes, by the kind of file it is."""
+    lowered = os.path.basename(path).lower()
+    results = []
+    text, legacy = strip_own_blocks(_decode(data))
+    if legacy:
+        notes.append("%s still has the v3.x immunize block, which fails at startup. "
+                     "Run `mayashield -immunize` to replace it." % path)
+    if lowered == "maya.env" or lowered.endswith(".mod"):
+        evidence = _env_evidence(text, path)
+        if evidence:
+            results.append({"score": 0, "families": [], "evidence": evidence})
+    elif lowered.endswith(".pres.mel"):
+        # Stock Maya file full of UI strings: only family strings count.
+        results.append(_family_only(text))
+    elif lowered in _PREFS_NAMES:
+        results.append(_analyze_prefs(data))
+    else:
+        results.append(analyzer.analyze_text(text, lang="python" if lowered.endswith(".py") else "mel", context=context))
+    return results
 
 
 def inspect_file(path):
@@ -309,23 +359,7 @@ def inspect_file(path):
                 {"rule": "pyc_family_string", "category": "family", "weight": 90,
                  "detail": "Compiled file contains '%s'" % match.group(0).decode("latin-1")[:60]}]})
     elif data:
-        text, legacy = strip_own_blocks(_decode(data))
-        if legacy:
-            notes.append("%s still has the v3.x immunize block, which fails at startup. "
-                         "Run `mayashield -immunize` to replace it." % path)
-        if lowered == "maya.env" or lowered.endswith(".mod"):
-            evidence = _env_evidence(text, path)
-            if evidence:
-                results.append({"score": 0, "families": [], "evidence": evidence})
-        else:
-            language = "python" if lowered.endswith(".py") else "mel"
-            if lowered.endswith(".pres.mel"):
-                # Stock Maya file full of UI strings: only family strings count.
-                results.append(_family_only(text))
-            elif lowered in _PREFS_NAMES:
-                results.append(_analyze_prefs(data))
-            else:
-                results.append(analyzer.analyze_text(text, lang=language, context=context))
+        results.extend(_analyze_content(path, data, context, notes))
 
     combined = analyzer.merge_analyses(results) if results else {"score": 0, "evidence": [], "families": []}
     combined["context"] = context
@@ -415,31 +449,196 @@ def _manifest_path(folder):
 
 
 def _load_manifest(folder):
+    """The quarantine records.
+
+    A manifest that cannot be understood is moved aside, never overwritten: it is
+    the only place that says where the stored copies came from.
+    """
+    path = _manifest_path(folder)
+    if not os.path.exists(path):
+        return _records_from_copies(folder)   # nothing stored yet, or the list was lost
     try:
-        with open(_manifest_path(folder), "r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except (IOError, OSError, ValueError):
+        with open(path, "r", encoding="utf-8") as handle:
+            records = json.load(handle)
+        if isinstance(records, list) and all(isinstance(item, dict) for item in records):
+            return records
+    except (IOError, OSError):
         return []
+    except ValueError:
+        pass
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    try:
+        fileops.replace(path, "%s.damaged-%s" % (path, stamp))
+    except OSError:
+        pass
+    return _records_from_copies(folder)
+
+
+def _records_from_copies(folder):
+    """What can still be said about stored copies when the manifest is lost.
+
+    Where each file came from is not in its name, so these cannot be put back
+    automatically; they are listed so the user knows they exist and where.
+    """
+    records = []
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return records
+    for name in names:
+        if not name.endswith(".quarantine"):
+            continue
+        stored = os.path.join(folder, name)
+        parts = name[:-len(".quarantine")].rsplit(".", 1)
+        try:
+            when = datetime.datetime.fromtimestamp(os.path.getmtime(stored)).strftime("%Y-%m-%d %H:%M:%S")
+            digest = sha256_file(stored)
+        except (IOError, OSError):
+            continue
+        records.append({"id": parts[-1] if len(parts) == 2 else name, "original": "", "stored": stored,
+                        "sha256": digest, "time": when, "reasons": [], "action": "moved",
+                        "note": "original location unknown (%s)" % parts[0]})
+    return records
 
 
 def _save_manifest(folder, records):
     temporary = _manifest_path(folder) + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
+    with open(temporary, "w", encoding="utf-8", errors="backslashreplace") as handle:
         json.dump(records, handle, indent=2, ensure_ascii=False)
-    os.replace(temporary, _manifest_path(folder))
+    fileops.replace(temporary, _manifest_path(folder))
 
 
 def _store_copy(path, reasons, folder, record_action):
     os.makedirs(folder, exist_ok=True)
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    # The time for people, a random part so two files handled in the same clock tick never share a name.
+    stamp = "%s_%s" % (datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f"), uuid.uuid4().hex[:8])
     stored = os.path.join(folder, "%s.%s.quarantine" % (os.path.basename(path), stamp))
+    records = _load_manifest(folder)   # before the copy exists: a lost list is rebuilt from the copies
     shutil.copy2(path, stored)
-    records = _load_manifest(folder)
+    fileops.make_writable(stored)   # a copy of a read-only file must still be removable on restore
     record = {"id": stamp, "original": path, "stored": stored, "sha256": sha256_file(stored),
               "time": now(), "reasons": list(reasons), "action": record_action}
     records.append(record)
     _save_manifest(folder, records)
     return record
+
+
+def _drop_record(folder, record):
+    """Undo _store_copy after the change it was made for did not happen."""
+    if record is None:
+        return
+    try:
+        fileops.remove_quietly(record["stored"])
+        records = [item for item in _load_manifest(folder) if item.get("id") != record["id"]]
+        _save_manifest(folder, records)
+    except (IOError, OSError, ValueError):
+        pass
+
+
+def _write_file(path, data):
+    """Replace a file's bytes in one step, read-only or not, keeping its read-only state."""
+    temporary = path + ".mayashield_tmp"
+    mode = None
+    try:
+        fileops.remove(temporary)
+        with open(temporary, "wb") as handle:
+            handle.write(data)
+        mode = fileops.make_writable(path)
+        fileops.replace(temporary, path)
+    except Exception:
+        fileops.remove_quietly(temporary)
+        if os.path.exists(path):
+            fileops.restore_mode(path, mode)
+        raise
+    fileops.restore_mode(path, mode)
+
+
+_SIMPLE_STATEMENTS = (ast.Import, ast.ImportFrom, ast.Expr, ast.Assign, ast.AugAssign, ast.Delete)
+
+
+def _only_comment(line):
+    text = line.strip()
+    return not text or text.startswith(b"#")
+
+
+def _repair_python(data):
+    """userSetup.py without the family's own statements, or None.
+
+    Only whole top-level statements that sit alone on their line are taken out,
+    and only when the syntax tree of the result is the tree of the original minus
+    exactly those statements.  A user's own code that merely mentions the family
+    (the widely shared "kill the leukocyte scriptJob" snippet does) is left as
+    it is: deleting an ``if`` line from inside it once turned that snippet into
+    one that killed every scriptJob in the session.
+    """
+    if pyguard.needs_guard(data.decode("latin-1")):
+        return None
+    try:
+        tree = ast.parse(data)   # bytes: honours a coding cookie and a BOM
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    lines = data.splitlines(True)
+    body = tree.body
+    drop_lines = set()
+    drop_nodes = set()
+    for index, node in enumerate(body):
+        if not isinstance(node, _SIMPLE_STATEMENTS):
+            continue
+        first = node.lineno
+        last = body[index + 1].lineno - 1 if index + 1 < len(body) else len(lines)
+        while last > first and _only_comment(lines[last - 1]):
+            last -= 1
+        if last != first or first > len(lines):
+            continue
+        if _PY_FAMILY_LINE_RE.match(lines[first - 1].decode("latin-1")):
+            drop_lines.add(first - 1)
+            drop_nodes.add(index)
+    if not drop_lines:
+        return None
+    result = b"".join(line for index, line in enumerate(lines) if index not in drop_lines)
+    try:
+        after = ast.parse(result)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    expected = [ast.dump(node) for index, node in enumerate(body) if index not in drop_nodes]
+    if [ast.dump(node) for node in after.body] != expected:
+        return None
+    return result
+
+
+def _repair_env(path, data):
+    """Maya.env or a .mod file without the lines that were flagged, or None."""
+    is_mod = path.lower().endswith(".mod")
+    lines = data.splitlines(True)
+    kept = [line for line in lines if not _env_line_evidence(_decode(line), is_mod)]
+    return b"".join(kept) if len(kept) != len(lines) else None
+
+
+def _repair_prefs(data):
+    """userPrefs.mel / pluginPrefs.mel without the statements that run code, or None.
+
+    The preferences themselves stay: taking the whole file away resets every
+    setting the user has, in every Maya version the scan reached.
+    """
+    ranges = []
+    for statement in iter_statements(data):
+        if statement.command == b"optionVar":
+            continue
+        result = analyzer.analyze_text(_decode(data[statement.start:statement.end]), lang="mel",
+                                       context=analyzer.CONTEXT_STARTUP)
+        if result["score"] >= rules.RISK_LOW or any(
+                item["category"] in _PREFS_ACTIVE_CATEGORIES or item["category"] == "family"
+                for item in result["evidence"]):
+            ranges.append(_expand_to_lines(data, statement.start, statement.end))
+    if not ranges:
+        return None
+    pieces = []
+    position = 0
+    for start, end in merge_ranges(ranges):
+        pieces.append(data[position:start])
+        position = end
+    pieces.append(data[position:])
+    return b"".join(pieces)
 
 
 def repaired_content(path, data):
@@ -450,23 +649,39 @@ def repaired_content(path, data):
     """
     name = os.path.basename(path).lower()
     if name.endswith(".mel"):
+        repaired = None
         position = data.find(MEL_INFECTION_HEADER)
         if position >= 0:
             # Published cleanup: the header and everything after it is the virus.
-            return data[:position].rstrip() + b"\n" if data[:position].strip() else b""
-        return None
+            repaired = data[:position].rstrip() + b"\n" if data[:position].strip() else b""
+        if name in _PREFS_NAMES:
+            cut = _repair_prefs(data if repaired is None else repaired)
+            return repaired if cut is None else cut
+        return repaired
     if name == "usersetup.py":
-        lines = data.splitlines(True)
-        kept = [line for line in lines if not _PY_FAMILY_LINE_RE.match(line.decode("latin-1"))]
-        if len(kept) == len(lines):
-            return None
-        result = b"".join(kept)
-        try:
-            compile(result, path, "exec")
-        except (SyntaxError, ValueError):
-            return None
-        return result
+        return _repair_python(data)
+    if name == "maya.env" or name.endswith(".mod"):
+        return _repair_env(path, data)
     return None
+
+
+def _usable_repair(path, data, threshold):
+    """repaired_content, kept only if it really brings the file below the threshold."""
+    try:
+        repaired = repaired_content(path, data)
+        if repaired is None:
+            return None
+        results = _analyze_content(path, repaired, _classify(path), [])
+        verdict = analyzer.merge_analyses(results)["score"] if results else 0
+    except Exception:   # RecursionError, MemoryError...: whatever it was, this is not a repair to trust
+        return None
+    return repaired if verdict < threshold else None
+
+
+def _stays_in_place(path):
+    """Files that are never moved away: Maya's own, which it needs or would recreate empty."""
+    name = os.path.basename(path).lower()
+    return name.endswith(".pres.mel") or name in _PREFS_NAMES
 
 
 def clean_disk(env=None, dry_run=False, scan_all=False, threshold=rules.RISK_HIGH, verbose=False):
@@ -474,7 +689,8 @@ def clean_disk(env=None, dry_run=False, scan_all=False, threshold=rules.RISK_HIG
 
     A startup file with an identifiable infection is repaired in place so the
     studio's own setup keeps working; the original always goes to quarantine
-    first.  Files under the Maya install are never moved, only repaired.
+    first.  Files under the Maya install, and Maya's preference files, are never
+    moved, only repaired.  One file failing does not stop the rest.
     """
     env = env or mayapaths.snapshot()
     report = scan_disk(env=env, scan_all=scan_all, verbose=verbose)
@@ -491,14 +707,20 @@ def clean_disk(env=None, dry_run=False, scan_all=False, threshold=rules.RISK_HIG
         path = hit["path"]
         action = {"src": path, "dst": "", "reasons": hit["reasons"], "sha256": hit.get("sha256"), "status": ""}
         report["actions"].append(action)
+        record = None
         try:
-            data = _read_bytes(path, limit=64 * 1024 * 1024)
-            repaired = repaired_content(path, data)
-            if repaired is not None and analyzer.analyze_text(
-                    _decode(repaired), lang="python" if path.lower().endswith(".py") else "mel",
-                    context=analyzer.CONTEXT_STARTUP)["score"] >= threshold:
-                repaired = None
-            must_stay = path.lower().endswith(".pres.mel")
+            # Look again before touching anything: an earlier step of this very run may
+            # have dealt with the file already.
+            if not os.path.isfile(path):
+                action["status"] = "already gone"
+                continue
+            if inspect_file(path)["score"] < threshold:
+                action["status"] = "already clean"
+                continue
+            too_large = os.path.getsize(path) > _MAX_STARTUP_BYTES
+            data = b"" if too_large else _read_bytes(path, limit=_MAX_STARTUP_BYTES)
+            repaired = None if too_large else _usable_repair(path, data, threshold)
+            must_stay = _stays_in_place(path)
 
             if dry_run:
                 action["status"] = "would_repair" if repaired is not None else (
@@ -511,19 +733,20 @@ def clean_disk(env=None, dry_run=False, scan_all=False, threshold=rules.RISK_HIG
             record = _store_copy(path, hit["reasons"], folder, "repaired" if repaired is not None else "moved")
             action["dst"] = record["stored"]
             if repaired is not None:
-                temporary = path + ".mayashield_tmp"
-                with open(temporary, "wb") as handle:
-                    handle.write(repaired)
-                os.replace(temporary, path)
+                _write_file(path, repaired)
                 action["status"] = "repaired"
                 _note_repair(folder, record["id"], hashlib.sha256(repaired).hexdigest())
             else:
-                os.remove(path)
+                fileops.remove(path)
                 action["status"] = "quarantined"
         except PermissionError as error:
+            _drop_record(folder, record)
+            action["dst"] = ""
             action["status"] = "needs administrator rights: %s" % error
-        except (IOError, OSError) as error:
-            action["status"] = "failed: %s" % error
+        except Exception as error:   # one file must not stop the others
+            _drop_record(folder, record)
+            action["dst"] = ""
+            action["status"] = "failed: %s: %s" % (type(error).__name__, error)
     return report
 
 
@@ -547,7 +770,10 @@ def restore(record_id):
     for record in records:
         if record.get("id") != record_id:
             continue
-        original, stored = record["original"], record["stored"]
+        original, stored = record.get("original", ""), record.get("stored", "")
+        if not original:
+            return {"status": "failed", "reason": "Where this file came from is no longer known. "
+                                                  "The stored copy is %s." % stored}
         try:
             if sha256_file(stored) != record.get("sha256"):
                 return {"status": "failed", "reason": "%s has changed since it was quarantined." % stored}
@@ -558,9 +784,17 @@ def restore(record_id):
                                                           "The quarantined copy is at %s." % (original, stored)}
             os.makedirs(os.path.dirname(original), exist_ok=True)
             temporary = original + ".mayashield_tmp"
+            fileops.remove(temporary)
             shutil.copy2(stored, temporary)
-            os.replace(temporary, original)
-            os.remove(stored)
+            mode = fileops.make_writable(original) if os.path.exists(original) else None
+            try:
+                fileops.replace(temporary, original)
+            except OSError:
+                fileops.remove_quietly(temporary)
+                if os.path.exists(original):
+                    fileops.restore_mode(original, mode)
+                raise
+            fileops.remove_quietly(stored)
         except (IOError, OSError) as error:
             return {"status": "failed", "reason": str(error)}
         records.remove(record)
@@ -569,38 +803,79 @@ def restore(record_id):
     return {"status": "failed", "reason": "No quarantine record with id %s." % record_id}
 
 
+def _own_block_lines(bare):
+    """Indexes of the lines (endings already stripped) that make up MayaShield's own blocks.
+
+    Returns (set of indexes, found a v3 block).  Same rules as strip_own_blocks: only
+    the exact texts count, so a marker cannot be used to hide other code.
+    """
+    drop = set()
+    legacy = False
+    block = [line.encode("latin-1") for line in GUARD_BLOCK.rstrip("\n").split("\n")]
+    index = 0
+    while index + len(block) <= len(bare):
+        if bare[index:index + len(block)] == block:
+            drop.update(range(index, index + len(block)))
+            index += len(block)
+        else:
+            index += 1
+    marker = _LEGACY_MARKER.encode("latin-1")
+    anchor = [line.encode("latin-1") for line in _LEGACY_ANCHOR.rstrip("\n").split("\n")]
+    for start, line in enumerate(bare):
+        if not line.startswith(marker):
+            continue
+        for end in range(start + 1, len(bare) - len(anchor) + 1):
+            if bare[end:end + len(anchor)] == anchor:
+                text = b"\n".join(bare[start:end + len(anchor)]).decode("latin-1") + "\n"
+                stamped = re.sub(r"^# Auto-generated at .*$", "# Auto-generated at", text, flags=re.M).strip()
+                if hashlib.sha256(stamped.encode("utf-8")).hexdigest() == _LEGACY_SHA256:
+                    drop.update(range(start, end + len(anchor)))
+                    legacy = True
+                break
+        break
+    return drop, legacy
+
+
 def write_guard_block(script_dir):
     """Add or refresh the immunize block in userSetup.py, replacing any v3 block.
 
-    Everything else in the file keeps its exact bytes and line endings, and the
+    Every other line keeps its exact bytes and its own line ending, and the
     previous version is kept beside it.
     """
     path = os.path.join(script_dir, "userSetup.py")
+    if os.path.isfile(path) and os.path.getsize(path) > _MAX_STARTUP_BYTES:
+        return {"status": "failed", "userSetup.py": path,
+                "reason": "userSetup.py is larger than %d MB and was left alone." % (_MAX_STARTUP_BYTES // (1024 * 1024))}
     data = _read_bytes(path, limit=_MAX_STARTUP_BYTES) if os.path.isfile(path) else b""
-    # Latin-1 maps every byte to one character, so nothing gets re-encoded.
-    existing = data.decode("latin-1")
-    crlf = "\r\n" in existing
-    normalized = existing.replace("\r\n", "\n")
-    cleaned, legacy = strip_own_blocks(normalized)
-    if GUARD_BLOCK in normalized and not legacy:
+    lines = data.splitlines(True)
+    drop, legacy = _own_block_lines([line.rstrip(b"\r\n") for line in lines])
+    if drop and not legacy and len(drop) == len(GUARD_BLOCK.rstrip("\n").split("\n")):
         return {"status": "already_immunized", "userSetup.py": path}
-    body = cleaned.rstrip("\n")
-    content = (body + "\n\n" if body else "") + GUARD_BLOCK
-    if crlf:
-        content = content.replace("\n", "\r\n")
+
+    kept = [line for index, line in enumerate(lines) if index not in drop]
+    # New lines take the ending of the line they follow; nothing already there is touched.
+    last_ending = kept[-1][len(kept[-1].rstrip(b"\r\n")):] if kept else b""
+    ending = last_ending if last_ending in (b"\r\n", b"\n", b"\r") else (b"\r\n" if b"\r\n" in data else b"\n")
+    body = b"".join(kept)
+    while body.endswith((b"\r", b"\n")):
+        body = body[:-1]
+    content = (body + ending + ending if body else b"") + GUARD_BLOCK.encode("latin-1").replace(b"\n", ending)
 
     os.makedirs(script_dir, exist_ok=True)
     result = {"status": "replaced_v3_block" if legacy else ("appended" if data else "created"), "userSetup.py": path}
-    if data:
-        backup = path + ".mayashield_bak"
-        index = 1
-        while os.path.exists(backup):
-            backup = "%s.mayashield_bak%d" % (path, index)
-            index += 1
-        shutil.copy2(path, backup)
-        result["backup"] = backup
-    temporary = path + ".mayashield_tmp"
-    with open(temporary, "wb") as handle:
-        handle.write(content.encode("latin-1"))
-    os.replace(temporary, path)
+    backup = None
+    try:
+        if data:
+            backup = path + ".mayashield_bak"
+            index = 1
+            while os.path.exists(backup):
+                backup = "%s.mayashield_bak%d" % (path, index)
+                index += 1
+            shutil.copy2(path, backup)
+            result["backup"] = backup
+        _write_file(path, content)
+    except (IOError, OSError) as error:
+        if backup:
+            fileops.remove_quietly(backup)   # nothing changed, so there is nothing to keep a copy of
+        return {"status": "failed", "userSetup.py": path, "reason": "Could not write userSetup.py: %s" % error}
     return result

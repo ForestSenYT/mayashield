@@ -15,10 +15,13 @@ import threading
 IN_PROCESS_LIMIT = 2
 MAX_WORKERS = 8
 _POLL_SECONDS = 0.2
+_HELLO_SECONDS = 30.0
 
 
 def execute_job(job):
     """Run one job in this process."""
+    if job.get("op") == "ping":
+        return {"pong": True}
     if job.get("op") == "clean":
         from .cleaner import clean_file
         kwargs = {"output_path": job.get("output"), "in_place": bool(job.get("in_place")),
@@ -42,9 +45,14 @@ def _failed_result(job, message):
 
 
 def default_interpreter():
-    """Interpreter for workers: mayapy inside Maya, otherwise this Python."""
+    """Interpreter for workers: this Python if that is what is running, else mayapy.
+
+    Inside Maya sys.executable is Maya itself (maya.exe, mayabatch.exe, "Maya" on
+    macOS).  Starting that as a worker would open eight more Mayas, none of which
+    speaks the job protocol.
+    """
     executable = os.path.basename(sys.executable or "").lower()
-    if executable and not executable.startswith("maya."):
+    if executable.startswith(("python", "mayapy")):
         return sys.executable
     from .mayapaths import find_mayapy
     return find_mayapy()
@@ -81,7 +89,30 @@ class _Worker(object):
         self.process.stdin.write((json.dumps(job) + "\n").encode("ascii"))
         self.process.stdin.flush()
 
+    def answers(self):
+        """Does this interpreter start, find the engine and speak the protocol at all?
+
+        Asked before the first real job.  A worker that dies on a scene is that
+        scene's doing; one that cannot even say hello is a broken interpreter, and
+        blaming every file in the folder for it would report a clean folder as
+        full of threats.
+        """
+        try:
+            self.send({"op": "ping"})
+            line = self.responses.get(timeout=_HELLO_SECONDS)
+            return line is not None and bool(json.loads(line.decode("ascii")).get("pong"))
+        except (OSError, ValueError, UnicodeDecodeError, queue.Empty):
+            return False
+
     def stop(self):
+        # A worker in the middle of a deep scan has a mayapy of its own running: take
+        # the whole tree, or that Maya outlives the scan it was started for.
+        if os.name == "nt" and self.process.poll() is None:
+            try:
+                subprocess.run(["taskkill", "/PID", str(self.process.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=15, creationflags=0x08000000)
+            except (OSError, subprocess.SubprocessError):
+                pass
         try:
             self.process.kill()
         except OSError:
@@ -139,7 +170,7 @@ def run_jobs(jobs, workers=None, timeout_sec=None, progress_cb=None, cancel_cb=N
         pending.put((index, job))
     results = [None] * len(jobs)
     lock = threading.Lock()
-    state = {"done": 0, "canceled": False, "spawn_failures": 0}
+    state = {"done": 0, "canceled": False, "unusable": False}
 
     def canceled():
         if state["canceled"]:
@@ -168,14 +199,21 @@ def run_jobs(jobs, workers=None, timeout_sec=None, progress_cb=None, cancel_cb=N
                     index, job = pending.get_nowait()
                 except queue.Empty:
                     return
+                if state["unusable"]:
+                    finish(index, job, execute_job_safely(job, "the worker interpreter does not start"))
+                    continue
                 if worker is None or worker.process.poll() is not None:
                     try:
                         worker = _Worker(interpreter)
+                        if not worker.answers():
+                            raise OSError("no answer from %s" % interpreter)
                     except (OSError, ValueError) as error:
-                        with lock:
-                            state["spawn_failures"] += 1
-                        finish(index, job, execute_job_safely(job, error))
+                        # Not this file's fault: do the work here, and stop trying to start workers.
+                        if worker is not None:
+                            worker.stop()
                         worker = None
+                        state["unusable"] = True
+                        finish(index, job, execute_job_safely(job, error))
                         continue
                 try:
                     worker.send(job)
