@@ -38,6 +38,7 @@ UNSCALED_CATEGORIES = ("family",)
 _FAMILY_VACCINE = "Vaccine (PuTianTongQi)"
 _FAMILY_MELUI = "MayaMelUIConfigurationFile"
 _FAMILY_SECURE = "maya_secure_system"
+_FAMILY_SELFTEST = "MayaShield self-test sample"
 
 _FAMILY_DEFS = (
     ("ioc_vaccine_gene", _FAMILY_VACCINE, r"\bvaccine_gene\b", 100),
@@ -57,6 +58,9 @@ _FAMILY_DEFS = (
     ("ioc_secure_system", _FAMILY_SECURE, r"\bmaya_secure_system\b", 100),
     ("ioc_code_chunk", _FAMILY_SECURE, r"\bcodeChunk\d+\b", 70),
     ("ioc_code_extractor", _FAMILY_SECURE, r"\bcodeExtractor\b", 50),
+    # Not a virus: the marker the installer's self-test puts in its sample (see selftest.py),
+    # so that checking an install never writes a real signature to disk.
+    ("ioc_selftest", _FAMILY_SELFTEST, r"MAYASHIELD-SELFTEST-4F3A9C2E", 100),
 )
 
 FAMILY_IOCS = tuple(
@@ -129,6 +133,33 @@ MA_ALLOWED_COMMANDS = frozenset((
     b"setAttr", b"webTutorialNotify",
 ))
 
+# Top-level statements that run code by their nature: calls that execute text,
+# definitions, variables and control flow.  One of these in a scene was put
+# there by somebody, and it runs the moment the file opens (checked in Maya
+# 2026: a top-level python() or source in a .ma both run on open).  An unknown
+# command that is not on this list is still unusual, but less telling.
+MA_CODE_COMMANDS = frozenset((
+    b"python", b"source", b"eval", b"evalDeferred", b"evalEcho", b"catch", b"catchQuiet", b"system", b"exec",
+    b"popen", b"scriptJob", b"scriptNode", b"commandPort", b"loadPlugin", b"unloadPlugin", b"global", b"proc",
+    b"if", b"for", b"while", b"do", b"switch", b"string", b"int", b"float", b"vector", b"matrix",
+    b"fopen", b"fprint", b"fwrite", b"sysFile",
+))
+
+# String attributes Maya runs as MEL without anyone opening a script editor.
+# Short and long names as saved by Maya 2026.  The render callbacks belong to
+# defaultRenderGlobals and run when a render starts or ends; the particle
+# expressions run when the simulation is evaluated.
+RENDER_CALLBACK_ATTRS = frozenset((
+    "pram", "poam", "prlm", "polm", "prm", "pom", "pfrm", "pfom",
+    "preMel", "postMel", "preRenderLayerMel", "postRenderLayerMel", "preRenderMel", "postRenderMel",
+    "preFurRenderMel", "postFurRenderMel",
+))
+PARTICLE_EXPRESSION_ATTRS = frozenset((
+    "icx", "irx", "irbx", "irax",
+    "internalCreationExpression", "internalRuntimeExpression", "internalRuntimeBeforeDynamicsExpression",
+    "internalRuntimeAfterDynamicsExpression",
+))
+
 # ---------------------------------------------------------------------------
 # Behaviours: (rule id, category, weight, regex).
 # ---------------------------------------------------------------------------
@@ -162,8 +193,11 @@ MEL_RULES = tuple(
         ("mel_scriptnode", "replication", 30,
          r"(?<![\w.$])scriptNode\s[^;]{0,400}?-(?:bs|beforeScript|as|afterScript)\b|\bcreateNode\s+\"?script\b"),
         ("mel_scene_save", "replication", 15, r"(?<![\w.$])file\s+(?:-[a-zA-Z]+\s+[^;]{0,80}?)?-(?:save|s)\b"),
-        ("mel_scriptjob", "trigger", 20, r"(?<![\w.$])scriptJob\s+-"),
-        ("mel_scriptjob_sticky", "trigger", 15, r"\bscriptJob\b[^;]{0,200}-(?:protected|pro|permanent|per)\b"),
+        # Rigs and pipeline tools register scriptJobs as a matter of course, protected
+        # ones included, so these say little alone.  They still complete the
+        # combinations below (self_replication, triggered_quit).
+        ("mel_scriptjob", "trigger", 15, r"(?<![\w.$])scriptJob\s+-"),
+        ("mel_scriptjob_sticky", "trigger", 8, r"\bscriptJob\b[^;]{0,200}-(?:protected|pro|permanent|per)\b"),
         ("mel_infinite_loop", "destructive", 20, r"\bwhile\s*\(\s*(?:1|true)\s*\)"),
     )
 )
@@ -227,7 +261,7 @@ PY_CALL_PREFIXES = ("os.spawn", "os.exec", "os.posix_spawn")
 
 # Attribute calls recognised by their last component on maya.cmds-like objects.
 PY_MAYA_LEAF_RULES = {
-    "scriptJob": ("py_scriptjob", "trigger", 20),
+    "scriptJob": ("py_scriptjob", "trigger", 15),
     "scriptNode": ("py_scriptnode", "replication", 30),
 }
 

@@ -1,0 +1,3 @@
+# Maya remembers a hash of every userSetup.py it runs and warns the user when one changes,
+# so the bootstrap must reach every build byte for byte the same (see installer/build.py).
+installer/payload/userSetup.py text eol=lf

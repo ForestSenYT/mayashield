@@ -34,7 +34,9 @@ def write_json(path, payload):
     parent = os.path.dirname(target)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(target, "w", encoding="utf-8") as handle:
+    # backslashreplace: a payload can put a lone surrogate into a detail string, which
+    # plain UTF-8 refuses to encode.
+    with open(target, "w", encoding="utf-8", errors="backslashreplace") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
     return target
 
@@ -66,10 +68,30 @@ def _name_evidence(node):
     return items
 
 
+def _callback_kind(node, attr):
+    """'render' or 'particle' when Maya runs this string attribute as MEL by itself."""
+    if attr in rules.RENDER_CALLBACK_ATTRS and (
+            node.type == "renderGlobals" or base_name(node.name) == "defaultRenderGlobals"):
+        return "render"
+    if attr in rules.PARTICLE_EXPRESSION_ATTRS:
+        return "particle"
+    return None
+
+
+_CALLBACK_EVIDENCE = {
+    "render": {"rule": "render_callback", "category": "trigger", "weight": 15,
+               "detail": "Runs when a render starts or ends"},
+    "particle": {"rule": "particle_expression", "category": "trigger", "weight": 15,
+                 "detail": "Runs whenever the particles are simulated"},
+}
+
+
 def assess_node(node):
     """Score one NodeRecord.  Returns (analysis, kind, flagged attribute names)."""
     results = []
     flagged = []
+    attr_scores = {}
+    callbacks = []
     is_script = node.type in _SCRIPT_TYPES
     is_expression = node.type in _EXPRESSION_TYPES
 
@@ -87,12 +109,18 @@ def assess_node(node):
             result = analyzer.analyze_text(value, lang=_script_language(node), context=analyzer.CONTEXT_SCRIPT)
         elif is_expression and attr in _EXPRESSION_ATTRS:
             result = analyzer.analyze_text(value, lang="mel", context=analyzer.CONTEXT_SCRIPT)
+        elif not is_script and not is_expression and _callback_kind(node, attr):
+            # Not a script node, but Maya runs this attribute as MEL all the same.
+            result = analyzer.analyze_text(value, lang="mel", context=analyzer.CONTEXT_SCRIPT)
+            if result["score"] >= rules.RISK_LOW and _callback_kind(node, attr) not in callbacks:
+                callbacks.append(_callback_kind(node, attr))
         else:
             result = analyzer.analyze_attr(value)
         if result["evidence"]:
             results.append(result)
             if result["score"] >= rules.RISK_LOW:
                 flagged.append(attr)
+                attr_scores[attr] = result["score"]
 
     if not results:
         return None, None, []
@@ -111,7 +139,10 @@ def assess_node(node):
             extra.append({"rule": "official_name_abuse", "category": "evasion", "weight": 40,
                           "detail": "Uses the name of a built-in Maya node to look harmless"})
     else:
-        runs_by_itself = is_expression  # expressions evaluate without being asked
+        # Expressions evaluate without being asked, and so do particle expressions.  A
+        # render callback waits for a render: unusual things there get a note, not a block.
+        runs_by_itself = is_expression or "particle" in callbacks
+    extra.extend(_CALLBACK_EVIDENCE[kind] for kind in callbacks)
     if runs_by_itself and any(item["category"] in rules.AUTO_RUN_ESCALATED_CATEGORIES for item in behaviours):
         extra.append({"rule": "auto_run_process", "category": "execution", "weight": 50,
                       "detail": "Starts a process or goes online as soon as the scene opens"})
@@ -119,6 +150,7 @@ def assess_node(node):
         combined = analyzer.merge_analyses([combined, {"score": 0, "evidence": extra, "families": []}])
 
     kind = "scriptAttr" if is_script else ("expression" if is_expression else "node")
+    combined["attr_scores"] = attr_scores
     return combined, kind, flagged
 
 
@@ -133,6 +165,7 @@ def _hit(kind, analysis, node=None, line=None, attrs=None, removable=None):
         "score": analysis["score"],
         "node": node,
         "attrs": attrs or [],
+        "attr_scores": dict(analysis.get("attr_scores") or {}),
         "families": analysis.get("families", []),
         "evidence": [
             {"rule": item["rule"], "weight": item["weight"], "detail": str(item.get("detail", ""))[:160]}
@@ -151,8 +184,17 @@ _ANOMALY_WEIGHT = {
 }
 
 
+def _runs_code(command):
+    """Is this top-level command one that executes code, declares or branches?"""
+    name = str(command or "")
+    return name.encode("latin-1", "replace") in rules.MA_CODE_COMMANDS or name[:1] in ("$", "{")
+
+
 def _assess_anomaly(anomaly):
     rule, weight, template = _ANOMALY_WEIGHT.get(anomaly.kind, ("anomaly", 30, "%s"))
+    if anomaly.kind == "statement" and _runs_code(anomaly.command):
+        # Certain to run when the file opens, and nothing Maya would have written.
+        rule, weight, template = "ma_code_statement", 70, "Statement that runs code as the scene opens: %s"
     label = anomaly.command if anomaly.kind in ("statement", "inline_code", "unusual_file_command") else anomaly.text
     base = {"rule": rule, "category": "structure", "weight": weight, "detail": template % label}
     results = [{"score": weight, "evidence": [base], "families": []}]
@@ -168,13 +210,15 @@ def build_report(doc):
     plan = {"nodes": [], "attrs": [], "extents": []}
 
     # In a .mb, an SLCT group may aim at a script node from earlier in the file.
+    # The name has to match exactly, namespace included: "ref:defaultRenderGlobals" being a
+    # script node says nothing about ":defaultRenderGlobals".
     executable = {}
     for node in doc.nodes:
         if node.type in _SCRIPT_TYPES or node.type in _EXPRESSION_TYPES:
-            executable[base_name(node.name)] = node.type
+            executable[node.name.lstrip(":|")] = node.type
     for node in doc.nodes:
-        if node.type == "<selected>" and base_name(node.name) in executable:
-            node.type = executable[base_name(node.name)]
+        if node.type == "<selected>" and node.name.lstrip(":|") in executable:
+            node.type = executable[node.name.lstrip(":|")]
 
     if not doc.parse_ok:
         analysis = {"score": 45, "families": [], "evidence": [
@@ -187,7 +231,7 @@ def build_report(doc):
         if analysis is None or analysis["score"] < rules.RISK_LOW:
             continue
         whole = (node.type in _SCRIPT_TYPES or node.type in _EXPRESSION_TYPES
-                 or any(item["rule"] == "name_family" for item in analysis["evidence"]))
+                 or (not node.shared and any(item["rule"] == "name_family" for item in analysis["evidence"])))
         hit = _hit(kind, analysis, node=node.name, attrs=flagged, removable="node" if whole else "attr")
         hits.append(hit)
         offsets.append((hit, node.offset))
@@ -203,6 +247,13 @@ def build_report(doc):
         if anomaly.extent:
             offsets.append((hit, anomaly.extent[0]))
             plan["extents"].append((hit, anomaly.extent))
+
+    dropped = getattr(doc, "anomalies_dropped", 0)
+    if dropped:
+        analysis = {"score": 55, "families": [], "evidence": [
+            {"rule": "ma_statement_flood", "category": "structure", "weight": 55,
+             "detail": "%d more statements Maya never writes were not examined one by one" % dropped}]}
+        hits.append(_hit("structure", analysis))
 
     if doc.type == "ma" and offsets:
         lines = line_numbers(doc.path, [offset for _hit_item, offset in offsets])
@@ -307,15 +358,22 @@ def scan_file(path, report_path=None, deep=False, timeout_sec=120, mayapy=None):
         report["hits"].append(_error_hit("scanException", "%s: %s" % (type(error).__name__, error)))
         report["note"] = "Static scan failed."
 
-    needs_deep = deep or not report["parse_ok"]
-    if needs_deep and mayapy:
+    _summarize(report)
+    # The deep scan opens the file in a real Maya.  Turning script nodes off there does not
+    # stop statements injected at the top level of a .ma, so only a file the static scan
+    # could read, and found nothing dangerous in, is ever handed to Maya.
+    unsafe = (not report["parse_ok"] or report["score"] >= rules.RISK_HIGH
+              or any(hit.get("kind") in ("structure", "error", "raw") for hit in report["hits"]))
+    if deep and unsafe:
+        report["deep_note"] = "Deep scan skipped: this file is not safe to open in Maya."
+    elif deep and mayapy:
         from . import headless  # Only needed when a real Maya session is wanted.
         deep_report = headless.deep_scan(target, mayapy, timeout_sec)
         report["engine"] = "static+mayapy"
         known = set(hit.get("node") for hit in report["hits"] if hit.get("node"))
         report["hits"].extend(hit for hit in deep_report.get("hits", []) if hit.get("node") not in known or not hit.get("node"))
         report["deep_note"] = deep_report.get("note", "")
-    elif deep and not mayapy:
+    elif deep:
         report["deep_note"] = "Deep scan skipped: mayapy was not found."
 
     _summarize(report)
@@ -326,7 +384,7 @@ def scan_file(path, report_path=None, deep=False, timeout_sec=120, mayapy=None):
     if report_path:
         try:
             report["report_path"] = write_json(report_path, report)
-        except (IOError, OSError):
+        except (IOError, OSError, ValueError):
             pass
     return report
 
@@ -416,6 +474,6 @@ def scan_folder(folder, recursive=True, report_path=None, workers=None, timeout_
     if report_path:
         try:
             payload["report_path"] = write_json(report_path, payload)
-        except (IOError, OSError):
+        except (IOError, OSError, ValueError):
             pass
     return payload

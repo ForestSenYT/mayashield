@@ -40,6 +40,7 @@ class SceneDoc(object):
         self.parse_ok = True
         self.parse_note = ""
         self.raw_hits = []       # family strings found outside parsed structures
+        self.anomalies_dropped = 0   # anomalies past the cap, counted but not kept
         self.layout = None       # format-specific data the cleaner needs
 
 

@@ -5,6 +5,7 @@ import json
 import maya.api.OpenMaya as om
 
 from . import __version__, cleaner, live, mayapaths, persistence, rules, scanner
+from .i18n import tr
 
 COMMAND = "mayashield"
 UI_COMMAND = "mayashieldUI"
@@ -17,6 +18,7 @@ USAGE = (
     "  mayashield -offlineCleanFile \"scene.ma|mb\" [-inPlace] [-offlineOut \"path\"]\n"
     "  mayashield -offlineCleanFolder \"folder\" [-inPlace] [-offlineOutDir \"path\"]\n"
     "  mayashield -listQuarantine | -restore \"id\" | -version\n"
+    "  mayashieldUI [-workspace] [-checkup]\n"
     "Options:\n"
     "  -dryRun  -verbose  -includeMedium  -timeout 120  -report \"path/to/report.json\"\n"
     "  -clean -scanAll also acts on files found outside the startup locations.\n"
@@ -225,9 +227,9 @@ class MayaShieldUICmd(om.MPxCommand):
         return MayaShieldUICmd()
 
     def doIt(self, arg_list):
-        values = [arg_list.asString(index) for index in range(len(arg_list))]
+        values = [arg_list.asString(index).lower() for index in range(len(arg_list))]
         try:
             from . import ui
-            ui.show_ui(workspace=("-workspace" in values or "-dock" in values))
+            ui.show_ui(workspace=("-workspace" in values or "-dock" in values), checkup="-checkup" in values)
         except Exception as error:
-            om.MGlobal.displayError("mayashieldUI failed: %s" % error)
+            om.MGlobal.displayError(tr("ui.failed", error))

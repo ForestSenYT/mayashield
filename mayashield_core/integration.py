@@ -6,7 +6,8 @@ import maya.api.OpenMaya as om
 import maya.cmds as cmds
 import maya.mel as mel
 
-from . import __version__, guard
+from . import __version__
+from .i18n import tr
 
 MENU_NAME = "MayaShieldMenu"
 STATUS_BUTTON = "MayaShieldStatusBtn"
@@ -20,6 +21,17 @@ OPT_REPORT = "mayashield_reportPath"
 ICON = "mayashield.png"
 _FALLBACK_ICON = "menuIconWindow.png"
 
+# Shelf buttons are recognised by this tag, so their visible text can follow the
+# interface language.  Buttons saved by 4.0 and 3.x only had an English annotation.
+_SHELF_BUTTONS = (
+    ("mayashield.open", "shelf.open", "shelf.open.label", "mayashieldUI -workspace;", ("MayaShield: Open",)),
+    ("mayashield.checkup", "shelf.checkup", "shelf.checkup.label", "mayashieldUI -workspace -checkup;",
+     ("MayaShield: Scan",)),
+)
+# 4.0 also had a "Clean" button that worked on files without showing what it found.
+# The panel's "Fix Now" replaces it.
+_RETIRED_SHELF_ANNOTATIONS = ("MayaShield: Clean",)
+
 
 def _icon():
     """The bundled icon when the module provides it, else a built-in one."""
@@ -30,16 +42,12 @@ def _icon():
     return _FALLBACK_ICON
 
 
-def _run_mel(command):
+def _show_panel(workspace, checkup=False):
     try:
-        mel.eval(command)
-    except RuntimeError as error:
-        om.MGlobal.displayError(str(error))
-
-
-def _show_panel(workspace):
-    from . import ui
-    ui.show_ui(workspace=workspace)
+        from . import ui
+        ui.show_ui(workspace=workspace, checkup=checkup)
+    except Exception as error:
+        om.MGlobal.displayError(tr("ui.failed", error))
 
 
 def install_menu():
@@ -48,21 +56,12 @@ def install_menu():
         return False
     uninstall_menu()
     menu = cmds.menu(MENU_NAME, label="MayaShield", parent=main_window, tearOff=True)
-    cmds.menuItem(label="Open Panel (Workspace)", parent=menu, command=lambda *_: _show_panel(True))
-    cmds.menuItem(label="Open Panel (Floating)", parent=menu, command=lambda *_: _show_panel(False))
+    cmds.menuItem(label=tr("menu.open"), parent=menu, command=lambda *_: _show_panel(True))
+    cmds.menuItem(label=tr("menu.checkup"), parent=menu, command=lambda *_: _show_panel(True, checkup=True))
     cmds.menuItem(divider=True, parent=menu)
-    for label, command in (
-        ("Scan", "mayashield -scan;"),
-        ("Scan All", "mayashield -scanAll;"),
-        ("Clean (Repair / Quarantine)", "mayashield -clean;"),
-        ("Clean Scene Nodes", "mayashield -cleanScene;"),
-        ("Clean Suspicious Jobs", "mayashield -cleanJobs;"),
-        ("Immunize (Startup Guard)", "mayashield -immunize;"),
-    ):
-        cmds.menuItem(label=label, parent=menu, command=lambda _checked=False, c=command: _run_mel(c))
+    cmds.menuItem(label=tr("menu.open.float"), parent=menu, command=lambda *_: _show_panel(False))
     cmds.menuItem(divider=True, parent=menu)
-    cmds.menuItem(label="Preferences...", parent=menu, command=lambda *_: show_preferences())
-    cmds.menuItem(label="About MayaShield...", parent=menu, command=lambda *_: show_about())
+    cmds.menuItem(label=tr("menu.about"), parent=menu, command=lambda *_: show_about())
     return True
 
 
@@ -77,7 +76,7 @@ def install_status_button():
         return bool(parent)
     try:
         cmds.iconTextButton(STATUS_BUTTON, parent=parent, style="iconOnly", image1=_icon(),
-                            annotation="MayaShield: open panel", command=lambda *_: _show_panel(True))
+                            annotation=tr("status.button"), command=lambda *_: _show_panel(True))
         return True
     except RuntimeError:
         return False
@@ -94,60 +93,41 @@ def install_shelf():
         return False
     if not cmds.shelfLayout(SHELF_NAME, exists=True):
         cmds.shelfLayout(SHELF_NAME, parent=top)
-    existing = {}
+    by_tag = {}
+    by_annotation = {}
     for child in cmds.shelfLayout(SHELF_NAME, q=True, childArray=True) or ():
-        if cmds.objectTypeUI(child) == "shelfButton":
-            existing[cmds.shelfButton(child, q=True, annotation=True)] = child
+        if cmds.objectTypeUI(child) != "shelfButton":
+            continue
+        tag = cmds.shelfButton(child, q=True, docTag=True) or ""
+        annotation = cmds.shelfButton(child, q=True, annotation=True) or ""
+        if annotation in _RETIRED_SHELF_ANNOTATIONS and not tag:
+            cmds.deleteUI(child)
+            continue
+        by_tag[tag] = child
+        by_annotation[annotation] = child
     icon = _icon()
-    for annotation, label, command in (
-        ("MayaShield: Open", "Shield", "mayashieldUI -workspace;"),
-        ("MayaShield: Scan", "Scan", "mayashield -scan;"),
-        ("MayaShield: Clean", "Clean", "mayashield -clean;"),
-    ):
-        settings = {"label": label, "imageOverlayLabel": label, "image": icon, "image1": icon,
-                    "command": command, "sourceType": "mel"}
-        if annotation in existing:
+    for tag, annotation_key, label_key, command, old_annotations in _SHELF_BUTTONS:
+        label = tr(label_key)
+        settings = {"label": label, "imageOverlayLabel": label, "image": icon, "image1": icon, "command": command,
+                    "sourceType": "mel", "annotation": tr(annotation_key), "docTag": tag}
+        existing = by_tag.get(tag)
+        if existing is None:
             # Maya restores saved shelves, so this also updates buttons from older versions.
-            cmds.shelfButton(existing[annotation], edit=True, **settings)
+            existing = next((by_annotation[name] for name in old_annotations if name in by_annotation), None)
+        if existing is not None:
+            cmds.shelfButton(existing, edit=True, **settings)
         else:
-            cmds.shelfButton(parent=SHELF_NAME, annotation=annotation, **settings)
+            cmds.shelfButton(parent=SHELF_NAME, **settings)
     return True
 
 
 def show_about():
-    message = ("MayaShield %s\n"
-               "Detects and removes Maya scene malware and startup persistence.\n\n"
-               "Commands:\n  mayashield   (scan, clean, immunize)\n  mayashieldUI (panel)\n\n"
-               "Tip: start with Dry Run." % __version__)
-    cmds.confirmDialog(title="About MayaShield", message=message, button=["OK"])
+    cmds.confirmDialog(title=tr("about.title"), message=tr("about.text", __version__), button=[tr("ok")])
 
 
 def show_preferences():
-    if cmds.window(PREFS_WINDOW, exists=True):
-        cmds.deleteUI(PREFS_WINDOW)
-    cmds.window(PREFS_WINDOW, title="MayaShield Preferences", sizeable=False)
-    cmds.columnLayout(adj=True, rowSpacing=8, columnAlign="left")
-    dry = cmds.checkBox(label="Default: Dry Run", value=guard.option_bool(OPT_DRYRUN, True))
-    verbose = cmds.checkBox(label="Default: Verbose", value=guard.option_bool(OPT_VERBOSE, False))
-    startup = cmds.checkBox(label="Scan startup files when Maya starts", value=guard.option_bool(guard.OPT_STARTUP))
-    runtime = cmds.checkBox(label="Check scenes before opening them", value=guard.option_bool(guard.OPT_RUNTIME))
-    cmds.text(label="Default report path (optional):", align="left")
-    report_value = cmds.optionVar(q=OPT_REPORT) if cmds.optionVar(exists=OPT_REPORT) else ""
-    report = cmds.textField(text=str(report_value or ""))
-
-    def save(*_):
-        guard.set_option_bool(OPT_DRYRUN, cmds.checkBox(dry, q=True, value=True))
-        guard.set_option_bool(OPT_VERBOSE, cmds.checkBox(verbose, q=True, value=True))
-        guard.set_option_bool(guard.OPT_STARTUP, cmds.checkBox(startup, q=True, value=True))
-        guard.set_option_bool(guard.OPT_RUNTIME, cmds.checkBox(runtime, q=True, value=True))
-        cmds.optionVar(sv=(OPT_REPORT, cmds.textField(report, q=True, text=True).strip()))
-        cmds.deleteUI(PREFS_WINDOW)
-
-    cmds.rowLayout(nc=2, adjustableColumn=1, columnAttach=[(1, "both", 0), (2, "both", 6)])
-    cmds.button(label="Save", command=save)
-    cmds.button(label="Cancel", command=lambda *_: cmds.deleteUI(PREFS_WINDOW))
-    cmds.setParent("..")
-    cmds.showWindow(PREFS_WINDOW)
+    """Settings live in the panel, under Advanced."""
+    _show_panel(True)
 
 
 def install_all():
@@ -156,7 +136,7 @@ def install_all():
         try:
             step()
         except Exception as error:
-            om.MGlobal.displayWarning("MayaShield: %s failed: %s" % (step.__name__, error))
+            om.MGlobal.displayWarning(tr("integration.failed", step.__name__, error))
 
 
 def uninstall_all():
@@ -165,6 +145,8 @@ def uninstall_all():
             step()
         except RuntimeError:
             pass
+    if cmds.window(PREFS_WINDOW, exists=True):
+        cmds.deleteUI(PREFS_WINDOW)
     try:
         from . import ui
         ui.close_ui()

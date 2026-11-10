@@ -37,8 +37,9 @@ def initializePlugin(mobject):
         raise RuntimeError("MayaShield 4 needs Python 3.7 or newer (Maya 2022 or later in Python 3 mode).")
     _ensure_engine_importable()
 
-    from mayashield_core import VENDOR, __version__, command, guard, integration
+    from mayashield_core import VENDOR, __version__, command, guard, i18n, integration
 
+    i18n.language()   # asks Maya for its interface language: here, on the main thread, once
     plugin = om.MFnPlugin(mobject, VENDOR, __version__, "Any")
     plugin.registerCommand(command.COMMAND, command.MayaShieldCmd.creator)
     plugin.registerCommand(command.UI_COMMAND, command.MayaShieldUICmd.creator)

@@ -7,6 +7,11 @@ nodes off with ``file -q -executeScriptNodes``, a flag Maya rejects in query mod
 so its pre-open protection never engaged.  A live scan after opening stays as a
 second layer for anything that arrives another way.
 
+How loudly it speaks depends on how sure it is.  A dangerous file stops with a
+dialog.  A file that is merely unusual opens, with a short note the user can
+follow up in the panel: interrupting people over maybes teaches them to click
+through the dialogs that matter.
+
 Batch sessions (render farms) are only warned: no dialog, no refused files.
 """
 import os
@@ -18,6 +23,7 @@ import maya.cmds as cmds
 import maya.utils
 
 from . import cleaner, live, mayapaths, persistence, rules, scanner
+from .i18n import explain_hit, tr
 
 OPT_STARTUP = "mayashield_startupGuardEnabled"
 OPT_RUNTIME = "mayashield_runtimeSceneGuardEnabled"
@@ -25,8 +31,10 @@ OPT_MAX_MB = "mayashield_guardMaxMB"
 DEFAULT_MAX_MB = 4096
 
 _DEBOUNCE_SECONDS = 3.0
+_MAX_REVIEWS = 10
 _callbacks = []
 _verdicts = {}             # (path, size, mtime) -> "allow" | "block"
+_reviews = []              # reports of files let through with a note, newest last
 _last_scene = ("", 0.0)
 _startup_checked = False
 
@@ -61,20 +69,57 @@ def _batch():
 
 
 def _ask(title, message, buttons, default, cancel):
-    """Separate function so tests can answer the dialog."""
-    return cmds.confirmDialog(title=title, message=message, button=buttons, defaultButton=default,
-                              cancelButton=cancel, dismissString=cancel)
+    """Ask the user.  ``buttons`` are keys such as "block"; the chosen key comes back.
+
+    Separate function so tests can answer the dialog.
+    """
+    labels = [tr("btn." + key) for key in buttons]
+    by_label = dict(zip(labels, buttons))
+    chosen = cmds.confirmDialog(title=title, message=message, button=labels, defaultButton=tr("btn." + default),
+                                cancelButton=tr("btn." + cancel), dismissString=tr("btn." + cancel))
+    return by_label.get(chosen, cancel)
+
+
+def _why(report):
+    """One plain sentence on why a file was flagged."""
+    hits = report.get("hits") or [{}]
+    return explain_hit(dict(hits[0], families=report.get("families") or hits[0].get("families")))
 
 
 def _summary(report, limit=6):
     lines = []
     for hit in report.get("hits", [])[:limit]:
-        label = hit.get("node") or hit.get("detail") or hit.get("reason")
-        lines.append("- %s  (%s, score %s)" % (label, hit.get("reason"), hit.get("score")))
+        label = hit.get("node") or hit.get("kind") or "-"
+        lines.append(tr("guard.line.item", label, explain_hit(hit)))
     extra = len(report.get("hits", [])) - limit
     if extra > 0:
-        lines.append("...and %d more." % extra)
+        lines.append(tr("guard.more", extra))
     return "\n".join(lines)
+
+
+def take_reviews():
+    """Reports of files that opened with a note.  Handing them over clears the list."""
+    reports = list(_reviews)
+    del _reviews[:]
+    return reports
+
+
+def _toast(text):
+    try:
+        cmds.inViewMessage(assistMessage=text, position="topCenter", fade=True, fadeStayTime=6000)
+    except Exception:
+        pass   # a hint only: no viewport, no hint
+
+
+def _note_review(path, report):
+    """Unusual but not clearly malicious: let it open and say so without interrupting."""
+    name = os.path.basename(path)
+    om.MGlobal.displayWarning(tr("guard.review.warn", name, report.get("score", 0)))
+    _reviews.append(report)
+    del _reviews[:-_MAX_REVIEWS]
+    if not _batch():
+        safe = name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        maya.utils.executeDeferred(_toast, tr("guard.review.toast", safe))
 
 
 def _file_path(file_object):
@@ -93,7 +138,7 @@ def _check_file(file_object, message_name):
     try:
         return _decide(_file_path(file_object), _OPERATIONS.get(message_name, "open"))
     except Exception as error:
-        om.MGlobal.displayWarning("MayaShield: pre-open check failed, allowing the file: %s" % error)
+        om.MGlobal.displayWarning(tr("guard.check.failed", error))
         return True
 
 
@@ -107,8 +152,7 @@ def _decide(path, operation):
         return True
     stat = os.stat(path)
     if stat.st_size > _max_bytes():
-        om.MGlobal.displayWarning("MayaShield: %s is above the pre-open scan limit; only the after-open "
-                                  "check will run." % os.path.basename(path))
+        om.MGlobal.displayWarning(tr("guard.toolarge", os.path.basename(path)))
         return True
     key = (os.path.normcase(path), stat.st_size, stat.st_mtime)
     if key in _verdicts:
@@ -121,45 +165,39 @@ def _decide(path, operation):
         hit.get("confidence") == "error" for hit in report.get("hits", ()))
     if score < rules.RISK_HIGH and not unverified:
         if score >= rules.RISK_MEDIUM:
-            om.MGlobal.displayWarning("MayaShield: review %s (risk score %d). Open the MayaShield panel for details."
-                                      % (os.path.basename(path), score))
+            _note_review(path, report)
         _verdicts[key] = "allow"
         return True
 
     if _batch():
-        om.MGlobal.displayWarning("MayaShield: %s scene %s (score %d). Batch mode does not block it.\n%s"
-                                  % ("UNVERIFIED" if score < rules.RISK_HIGH else "HIGH RISK", path, score,
-                                     _summary(report)))
+        om.MGlobal.displayWarning(tr("guard.batch", tr("guard.batch.unverified" if score < rules.RISK_HIGH
+                                                         else "guard.batch.high"), path, score, _summary(report)))
         return True
 
     if score >= rules.RISK_HIGH:
-        families = ", ".join(report.get("families", [])) or "unknown family"
-        message = ("MayaShield stopped this file before it could run anything.\n\n%s\nRisk score: %d (%s)\n\n%s\n\n"
-                   % (path, score, families, _summary(report)))
-        buttons = ["Block", "Clean Copy", "Open Anyway"] if not is_script and report.get("parse_ok", True) \
-            else ["Block", "Open Anyway"]
-        choice = _ask("MayaShield: dangerous file", message, buttons, "Block", "Block")
+        can_clean = not is_script and report.get("parse_ok", True)
+        message = tr("guard.block.text" if can_clean else "guard.block.text.plain", path, _why(report), _summary(report))
+        buttons = ["block", "clean_copy", "open_anyway"] if can_clean else ["block", "open_anyway"]
+        choice = _ask(tr("guard.block.title"), message, buttons, "block", "block")
     else:
-        message = ("MayaShield could not fully analyze this file, so it can't say the file is safe. "
-                   "It may be damaged, or built to confuse scanners.\n\n%s\n\n%s\n\n"
-                   % (path, report.get("note") or _summary(report)))
-        choice = _ask("MayaShield: file not verified", message, ["Block", "Open Anyway"], "Block", "Block")
+        message = tr("guard.unverified.text", path, report.get("note") or _summary(report))
+        choice = _ask(tr("guard.unverified.title"), message, ["block", "open_anyway"], "block", "block")
 
-    if choice == "Open Anyway":
+    if choice == "open_anyway":
         _verdicts[key] = "allow"
-        om.MGlobal.displayWarning("MayaShield: %s opened at your request, despite the warning." % path)
+        om.MGlobal.displayWarning(tr("guard.opened", path))
         return True
-    if choice == "Clean Copy":
+    if choice == "clean_copy":
         result = cleaner.clean_file(path)
         if result.get("cleaned"):
             target = result["output_path"]
-            om.MGlobal.displayWarning("MayaShield: clean copy written to %s" % target)
+            om.MGlobal.displayWarning(tr("guard.cleancopy", target))
             if operation == "open":
                 maya.utils.executeDeferred(_open_scene, target)
         else:
-            om.MGlobal.displayError("MayaShield: could not clean %s: %s" % (path, result.get("note")))
+            om.MGlobal.displayError(tr("guard.cleancopy.failed", path, result.get("note")))
     else:
-        om.MGlobal.displayWarning("MayaShield blocked %s." % path)
+        om.MGlobal.displayWarning(tr("guard.blocked", path))
     return False
 
 
@@ -167,14 +205,18 @@ def _open_scene(path):
     # Never at the cost of unsaved work: if the open that got refused had already asked
     # about saving, the answer no longer applies to this one.
     if cmds.file(q=True, modified=True):
-        om.MGlobal.displayWarning("MayaShield: this scene has unsaved changes, so the clean copy "
-                                  "was not opened for you: %s" % path)
+        om.MGlobal.displayWarning(tr("guard.cleancopy.unsaved", path))
         return
     cmds.file(path, open=True, force=True, prompt=False)
 
 
 def _after_scene_change(*_args):
     maya.utils.executeDeferred(after_scene_check)
+
+
+def _show_panel():
+    from . import ui
+    ui.show_ui(workspace=True, checkup=True)
 
 
 def after_scene_check():
@@ -195,33 +237,30 @@ def after_scene_check():
         if not scene_hits and not job_hits and not runtime_hits:
             return
 
-        lines = ["- Node: %s (%s)" % (hit["node"], hit["reason"]) for hit in scene_hits[:6]]
-        lines += ["- Job #%s: %s" % (hit.get("id"), str(hit.get("desc"))[:100]) for hit in job_hits[:6]]
-        lines += ["- %s: %s" % (hit["name"], hit["reason"]) for hit in runtime_hits[:6]]
+        lines = [tr("guard.line.node", hit["node"], explain_hit(hit)) for hit in scene_hits[:6]]
+        lines += [tr("guard.line.job", hit.get("id"), explain_hit(hit)) for hit in job_hits[:6]]
+        lines += [tr("guard.line.item", hit["name"], tr("what.running")) for hit in runtime_hits[:6]]
         text = "\n".join(lines)
 
         if _batch():
-            om.MGlobal.displayWarning("MayaShield: suspicious content in this session:\n%s" % text)
+            om.MGlobal.displayWarning(tr("guard.runtime.batch", text))
             return
 
-        choice = _ask("MayaShield Runtime Guard",
-                      "Suspicious content is active in this session:\n\n%s\n\nClean it now?" % text,
-                      ["Terminate + Clean", "Open Panel", "Ignore Once", "Disable Runtime Guard"],
-                      "Terminate + Clean", "Ignore Once")
-        if choice == "Terminate + Clean":
+        choice = _ask(tr("guard.runtime.title"), tr("guard.runtime.text", text),
+                      ["clean_now", "open_panel", "ignore", "disable"], "clean_now", "ignore")
+        if choice == "clean_now":
             jobs = live.clean_jobs()
             nodes = live.clean_scene()
-            om.MGlobal.displayWarning("MayaShield: killed %d job(s), deleted %d node(s)." % (
-                sum(1 for item in jobs["killed"] if item["status"] == "killed"),
-                sum(1 for item in nodes["deleted"] if item["status"] == "deleted")))
-        elif choice == "Open Panel":
-            from . import ui
-            ui.show_ui(workspace=True)
-        elif choice == "Disable Runtime Guard":
+            om.MGlobal.displayWarning(tr("guard.runtime.done",
+                                         sum(1 for item in jobs["killed"] if item["status"] == "killed"),
+                                         sum(1 for item in nodes["deleted"] if item["status"] == "deleted")))
+        elif choice == "open_panel":
+            _show_panel()
+        elif choice == "disable":
             set_option_bool(OPT_RUNTIME, False)
-            om.MGlobal.displayWarning("MayaShield: Runtime Guard disabled (MayaShield > Preferences).")
+            om.MGlobal.displayWarning(tr("guard.runtime.off"))
     except Exception as error:
-        om.MGlobal.displayWarning("MayaShield Runtime Guard error: %s" % error)
+        om.MGlobal.displayWarning(tr("guard.runtime.error", error))
 
 
 def install():
@@ -261,7 +300,7 @@ def startup_check():
         try:
             report = persistence.scan_disk(env=env, scan_all=False)
         except Exception as error:
-            maya.utils.executeDeferred(om.MGlobal.displayWarning, "MayaShield startup scan failed: %s" % error)
+            maya.utils.executeDeferred(om.MGlobal.displayWarning, tr("guard.startup.failed", error))
             return
         maya.utils.executeDeferred(_report_startup, report)
 
@@ -277,26 +316,21 @@ def _report_startup(report):
         if "immunize block" in note:
             om.MGlobal.displayWarning("MayaShield: %s" % note)
     if len(hits) > len(high):
-        om.MGlobal.displayInfo("MayaShield: %d startup file(s) worth reviewing. See the MayaShield panel."
-                               % (len(hits) - len(high)))
+        om.MGlobal.displayInfo(tr("guard.startup.review", len(hits) - len(high)))
     if not high:
         return
-    lines = ["- %s (%s)" % (hit["path"], ", ".join(hit["reasons"][:3])) for hit in high[:8]]
+    lines = [tr("guard.line.item", hit["path"], explain_hit(hit)) for hit in high[:8]]
     if len(high) > 8:
-        lines.append("...and %d more." % (len(high) - 8))
-    choice = _ask("MayaShield Warning",
-                  "Malware indicators in your Maya startup files:\n\n%s\n\n"
-                  "Clean Now repairs or quarantines them. Originals are kept and can be restored."
-                  % "\n".join(lines),
-                  ["Clean Now", "Open Panel", "Ignore Once", "Disable Guard"], "Clean Now", "Ignore Once")
-    if choice == "Clean Now":
+        lines.append(tr("guard.more", len(high) - 8))
+    choice = _ask(tr("guard.startup.title"), tr("guard.startup.text", "\n".join(lines)),
+                  ["clean_now", "open_panel", "ignore", "disable"], "clean_now", "ignore")
+    if choice == "clean_now":
         result = persistence.clean_disk()
         for action in result.get("actions", []):
             om.MGlobal.displayWarning("MayaShield: %s -> %s" % (action["src"], action["status"]))
-        om.MGlobal.displayWarning("MayaShield: restart Maya so nothing already loaded from these files stays active.")
-    elif choice == "Open Panel":
-        from . import ui
-        ui.show_ui(workspace=True)
-    elif choice == "Disable Guard":
+        om.MGlobal.displayWarning(tr("guard.startup.restart"))
+    elif choice == "open_panel":
+        _show_panel()
+    elif choice == "disable":
         set_option_bool(OPT_STARTUP, False)
-        om.MGlobal.displayWarning("MayaShield: Startup Guard disabled (MayaShield > Preferences).")
+        om.MGlobal.displayWarning(tr("guard.startup.off"))

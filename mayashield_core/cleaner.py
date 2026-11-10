@@ -3,18 +3,23 @@
 
 Only what the scan attributed to a threat is cut out.  Everything else stays
 byte-identical, the result is re-scanned before it replaces anything, and any
-file that gets replaced is kept as a backup first.
+file that gets replaced is kept as a backup first.  If the scene changes on disk
+while it is being cleaned (someone saved it), nothing is written.
 """
 import datetime
 import os
 import shutil
 
-from . import rules
+from . import fileops, rules
 from .ma_parser import rewrite_ma
 from .mb_parser import rewrite_mb
-from .scanner import build_report, parse_scene, write_json, list_scene_files, summarize_folder
+from .scanner import build_report, looks_like_scene, parse_scene, write_json, list_scene_files, summarize_folder
 
 BACKUP_SUFFIX = ".mayashield_bak"
+
+
+class _SceneChanged(Exception):
+    pass
 
 
 def default_output_path(path):
@@ -52,16 +57,14 @@ def _backup(path):
     """Copy a file aside.  Finished copies only: being killed halfway leaves no backup."""
     backup = _unique_backup_path(path)
     partial = backup + ".partial"
-    shutil.copy2(path, partial)
-    os.replace(partial, backup)
-    return backup
-
-
-def _make_writable(path):
+    fileops.remove(partial)   # one left by an earlier run that was killed, read-only or not
     try:
-        os.chmod(path, 0o666)
-    except OSError:
-        pass
+        shutil.copy2(path, partial)
+        fileops.replace(partial, backup)
+    except Exception:
+        fileops.remove_quietly(partial)
+        raise
+    return backup
 
 
 def _attr_ranges(node, attrs):
@@ -71,11 +74,28 @@ def _attr_ranges(node, attrs):
     return ranges
 
 
+def _attrs_to_remove(hit, threshold):
+    """The attributes of a hit that go at this threshold.
+
+    Each attribute is judged on its own score, so one dangerous value does not take
+    its harmless neighbours with it.  When the node only crosses the threshold
+    through several values together, all of the flagged ones go.
+    """
+    scores = hit.get("attr_scores") or {}
+    own = [attr for attr in hit["attrs"] if scores.get(attr, hit["score"]) >= threshold]
+    return own or list(hit["attrs"])
+
+
 def _select_targets(plan, threshold):
     nodes = [(hit, node) for hit, node in plan["nodes"] if hit["score"] >= threshold and node.extents]
     # Only attributes that can really be cut: a claim of "removed" must be true.
-    attrs = [(hit, node) for hit, node in plan["attrs"]
-             if hit["score"] >= threshold and _attr_ranges(node, hit["attrs"])]
+    attrs = []
+    for hit, node in plan["attrs"]:
+        if hit["score"] < threshold:
+            continue
+        names = [attr for attr in _attrs_to_remove(hit, threshold) if node.attr_extents.get(attr)]
+        if names:
+            attrs.append((hit, node, names))
     extents = [(hit, extent) for hit, extent in plan["extents"] if hit["score"] >= threshold]
     return nodes, attrs, extents
 
@@ -85,9 +105,9 @@ def _removal_records(nodes, attrs, extents):
     for hit, node in nodes:
         removed.append({"node": node.name, "type": node.type, "line": hit.get("line"), "status": "deleted",
                         "score": hit["score"], "reasons": [item["rule"] for item in hit["evidence"][:5]]})
-    for hit, node in attrs:
+    for hit, node, names in attrs:
         removed.append({"node": node.name, "type": node.type, "line": hit.get("line"), "status": "attribute removed",
-                        "attrs": hit["attrs"], "score": hit["score"],
+                        "attrs": names, "score": hit["score"],
                         "reasons": [item["rule"] for item in hit["evidence"][:5]]})
     for hit, _extent in extents:
         removed.append({"node": "<statement>", "type": "statement", "line": hit.get("line"), "status": "deleted",
@@ -118,17 +138,18 @@ def clean_file(path, output_path=None, in_place=False, threshold=rules.RISK_HIGH
         if report_path:
             try:
                 report["report_path"] = write_json(report_path, report)
-            except (IOError, OSError):
+            except (IOError, OSError, ValueError):
                 pass
         return report
 
     if not os.path.isfile(source):
         return finish("File does not exist.")
-    if not source.lower().endswith((".ma", ".mb")):
+    if not looks_like_scene(source):
         return finish("Not a Maya scene (.ma/.mb).")
 
     progress("Scanning", 15, os.path.basename(source))
     try:
+        seen = fileops.signature(source)
         doc = parse_scene(source)
         report["type"] = doc.type
         hits, plan = build_report(doc)
@@ -163,26 +184,36 @@ def clean_file(path, output_path=None, in_place=False, threshold=rules.RISK_HIGH
     else:
         destination = default_output_path(source)
 
+    def unchanged():
+        # The byte ranges to cut came from the first read.  They mean nothing in a file
+        # that has been saved again since.
+        if fileops.signature(source) != seen:
+            raise _SceneChanged()
+
     temporary = _temporary_path(destination)
+    backup = None
+    original_mode = None
     try:
         parent = os.path.dirname(destination)
         if parent:
             os.makedirs(parent, exist_ok=True)
 
         progress("Writing", 50, os.path.basename(destination))
+        unchanged()
         if doc.type == "ma":
             ranges = []
             for _hit, node in nodes:
                 ranges.extend(node.extents)
-            for hit, node in attrs:
-                ranges.extend(_attr_ranges(node, hit["attrs"]))
+            for _hit, node, names in attrs:
+                ranges.extend(_attr_ranges(node, names))
             ranges.extend(extent for _hit, extent in extents)
             report["links_removed"] = rewrite_ma(source, temporary, ranges, [node.name for _hit, node in nodes])
         else:
             drop_attr = []
-            for hit, node in attrs:
-                drop_attr.extend((node, extent) for extent in _attr_ranges(node, hit["attrs"]))
+            for _hit, node, names in attrs:
+                drop_attr.extend((node, extent) for extent in _attr_ranges(node, names))
             report["links_removed"] = rewrite_mb(source, temporary, doc, [node for _hit, node in nodes], drop_attr)
+        unchanged()
 
         progress("Verifying", 80, os.path.basename(destination))
         verify_doc = parse_scene(temporary)
@@ -193,7 +224,7 @@ def clean_file(path, output_path=None, in_place=False, threshold=rules.RISK_HIGH
         if remaining:
             report["remaining_hits"] = remaining[:100]
         if not verify_doc.parse_ok:
-            os.remove(temporary)
+            fileops.remove_quietly(temporary)
             report["removed"] = []
             return finish("Clean aborted: the rewritten file failed validation. Original untouched.")
 
@@ -202,17 +233,22 @@ def clean_file(path, output_path=None, in_place=False, threshold=rules.RISK_HIGH
         shutil.copymode(source, temporary)
         if os.path.exists(destination):
             backup = _backup(destination)
+            original_mode = fileops.make_writable(destination)
+        unchanged()
+        fileops.replace(temporary, destination)
+        if backup:
             report["backup_path" if in_place else "replaced_backup"] = backup
-            _make_writable(destination)
-        os.replace(temporary, destination)
     except Exception as error:
-        try:
-            if os.path.exists(temporary):
-                _make_writable(temporary)
-                os.remove(temporary)
-        except OSError:
-            pass
+        # Put back whatever was touched on the way here, so "untouched" is true.
+        fileops.remove_quietly(temporary)
+        if os.path.exists(destination):
+            fileops.restore_mode(destination, original_mode)
+        if backup:
+            fileops.remove_quietly(backup)
         report["removed"] = []
+        if isinstance(error, _SceneChanged):
+            return finish("Clean stopped, original untouched: the file was saved again while it was being cleaned. "
+                          "Run the clean once more.")
         return finish("Clean failed, original untouched: %s: %s" % (type(error).__name__, error))
 
     report["cleaned"] = True
@@ -251,6 +287,7 @@ def clean_folder(folder, recursive=True, report_path=None, output_root=None, in_
     cleaned = sum(1 for result in results if result.get("cleaned"))
     failed = sum(1 for result in results if result.get("remaining_hits_count", 0) > 0
                  or "failed" in str(result.get("note", "")).lower()
+                 or "stopped" in str(result.get("note", "")).lower()
                  or "aborted" in str(result.get("note", "")).lower())
     payload = summarize_folder(root, results, "Canceled by user." if canceled else "")
     payload.update({"output_root": out_root or root, "in_place": bool(in_place),
@@ -259,6 +296,6 @@ def clean_folder(folder, recursive=True, report_path=None, output_root=None, in_
     if report_path:
         try:
             payload["report_path"] = write_json(report_path, payload)
-        except (IOError, OSError):
+        except (IOError, OSError, ValueError):
             pass
     return payload

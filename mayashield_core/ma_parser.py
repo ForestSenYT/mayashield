@@ -10,8 +10,9 @@ selected, and only createNode and select change that.
 
 It works on bytes throughout and never re-encodes: a scene saved under a Chinese
 locale (``//Codeset: 936``) survives a clean byte for byte.  The file is memory
-mapped and scanned with one regular expression that only stops at characters
-that matter, so the numeric arrays making up most of a scene cost almost nothing.
+mapped, and the tokenizer jumps from one character that matters to the next with
+plain byte searches, so the numeric arrays making up most of a scene are skipped
+at memory speed instead of being read.
 """
 import mmap
 import os
@@ -25,15 +26,13 @@ MAX_STATEMENT_TEXT = 4 * 1024 * 1024
 MAX_ANOMALIES = 500
 _ARGS_WINDOW = 8192
 
-# Every alternative starts with a literal, which lets the regex engine skip to the
-# next candidate byte at C speed.
-_SCAN_RE = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"|"|;|//[^\n]*|/\*.*?(?:\*/|\Z)|`|\$|\(', re.S)
+_STRING_RE = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"', re.S)
 _GAP_RE = re.compile(rb"(?:\s+|//[^\n]*|/\*.*?(?:\*/|\Z))*", re.S)
 _COMMAND_RE = re.compile(rb"[^\s;(\"`]+")
 _ARG_RE = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"|[^\s;]+', re.S)
 _CODESET_RE = re.compile(rb"^//\s*Codeset:\s*(\S+)", re.I | re.M)
 
-_QUOTE, _SEMICOLON, _SLASH, _BACKTICK, _DOLLAR, _PAREN = 0x22, 0x3B, 0x2F, 0x60, 0x24, 0x28
+_SEMICOLON, _SLASH, _STAR = 0x3B, 0x2F, 0x2A
 _NAME_START = frozenset(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_")
 _NAME_BYTES = _NAME_START | frozenset(b"0123456789")
 
@@ -56,9 +55,20 @@ class Statement(object):
 
 
 def iter_statements(data):
-    """Yield the statements of a .ma held in bytes or an mmap."""
+    """Yield the statements of a .ma held in bytes or an mmap.
+
+    Only six characters can matter between a command and the end of its
+    statement: a quote, a semicolon, a slash (comments), a backtick, a dollar
+    sign and an opening parenthesis.  The position of the next one of each is
+    remembered and searched for again only once the scan has passed it, so every
+    byte of the file is looked at a fixed number of times, by ``find``.
+    tests/test_tokenizer.py holds the regular-expression version this replaced
+    and checks the two agree, statement for statement.
+    """
     size = len(data)
+    find = data.find
     pos = 3 if data[:3] == b"\xef\xbb\xbf" else 0
+    next_semicolon = next_quote = next_slash = next_backtick = next_dollar = next_paren = -1
     while True:
         pos = _GAP_RE.match(data, pos).end()
         if pos >= size:
@@ -67,29 +77,71 @@ def iter_statements(data):
             pos += 1
             continue
         match = _COMMAND_RE.match(data, pos)
-        command = match.group(0) if match else data[pos:pos + 1]
-        statement = Statement(command, pos)
+        statement = Statement(match.group(0) if match else data[pos:pos + 1], pos)
         statement.end = size
-        for token in _SCAN_RE.finditer(data, match.end() if match else pos + 1):
-            start = token.start()
-            first = data[start]
-            if first == _QUOTE:
-                end = token.end()
-                if end - start >= 2:
-                    statement.literals.append(data[start + 1:end - 1])
-            elif first == _SEMICOLON:
-                statement.end = token.end()
+        cursor = match.end() if match else pos + 1
+        while True:
+            if next_semicolon < cursor:
+                next_semicolon = find(b";", cursor)
+                if next_semicolon < 0:
+                    next_semicolon = size
+            if next_quote < cursor:
+                next_quote = find(b'"', cursor)
+                if next_quote < 0:
+                    next_quote = size
+            if next_slash < cursor:
+                next_slash = find(b"/", cursor)
+                if next_slash < 0:
+                    next_slash = size
+            if next_backtick < cursor:
+                next_backtick = find(b"`", cursor)
+                if next_backtick < 0:
+                    next_backtick = size
+            if next_dollar < cursor:
+                next_dollar = find(b"$", cursor)
+                if next_dollar < 0:
+                    next_dollar = size
+            if next_paren < cursor:
+                next_paren = find(b"(", cursor)
+                if next_paren < 0:
+                    next_paren = size
+            first = min(next_semicolon, next_quote, next_slash, next_backtick, next_dollar, next_paren)
+            if first >= size:
+                break                      # no semicolon left: the statement runs to the end
+            if first == next_semicolon:
+                statement.end = first + 1
                 break
-            elif first == _BACKTICK:
+            if first == next_quote:
+                literal = _STRING_RE.match(data, first)
+                if literal:
+                    cursor = literal.end()
+                    statement.literals.append(data[first + 1:cursor - 1])
+                else:
+                    cursor = first + 1     # a quote that never closes
+            elif first == next_slash:
+                following = data[first + 1] if first + 1 < size else -1
+                if following == _SLASH:    # a // comment, up to the end of its line
+                    cursor = find(b"\n", first)
+                    if cursor < 0:
+                        cursor = size
+                elif following == _STAR:   # a /* comment */
+                    cursor = find(b"*/", first + 2)
+                    cursor = size if cursor < 0 else cursor + 2
+                else:
+                    cursor = first + 1
+            elif first == next_backtick:
                 statement.inline_code = True
-            elif first == _DOLLAR:
-                if start + 1 < size and data[start + 1] in _NAME_START:
+                cursor = first + 1
+            elif first == next_dollar:
+                if first + 1 < size and data[first + 1] in _NAME_START:
                     statement.inline_code = True
-            elif first == _PAREN:
+                cursor = first + 1
+            else:
                 # `name (` is a call.  Maya's own `-type "string" (` is not.
-                before = data[max(0, start - 64):start].rstrip()
+                before = data[max(0, first - 64):first].rstrip()
                 if before and before[-1] in _NAME_BYTES and not statement.inline_code:
                     statement.inline_code = _ends_with_name(before)
+                cursor = first + 1
         yield statement
         pos = statement.end
 
@@ -333,11 +385,18 @@ def parse_ma(path):
                 return _ARG_RE.findall(data[statement.start:end].rstrip(b"; \t\r\n"))
 
             def anomaly(kind, statement):
-                if len(doc.anomalies) < MAX_ANOMALIES:
+                # Hundreds of harmless-looking unknown statements must not use up the
+                # allowance and so hide the one that matters: those that run code keep
+                # a second allowance of their own, and whatever is left out is counted.
+                telling = kind != "statement" or statement.command in rules.MA_CODE_COMMANDS \
+                    or statement.command[:1] in (b"$", b"{")
+                if len(doc.anomalies) < MAX_ANOMALIES or (telling and len(doc.anomalies) < 2 * MAX_ANOMALIES):
                     end = min(statement.end, statement.start + MAX_STATEMENT_TEXT)
                     doc.anomalies.append(Anomaly(kind, statement.command.decode("latin-1"),
                                                  decoder(data[statement.start:end]), None,
                                                  (statement.start, statement.end)))
+                else:
+                    doc.anomalies_dropped += 1
 
             builder = _SceneBuilder(doc, decoder, args_of)
             for statement in iter_statements(data):
