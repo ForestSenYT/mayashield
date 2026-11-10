@@ -27,12 +27,18 @@ MAX_ANOMALIES = 500
 _ARGS_WINDOW = 8192
 
 _STRING_RE = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"', re.S)
-_GAP_RE = re.compile(rb"(?:\s+|//[^\n]*|/\*.*?(?:\*/|\Z))*", re.S)
+_SPACE_RE = re.compile(rb"\s*")
 _COMMAND_RE = re.compile(rb"[^\s;(\"`]+")
 _ARG_RE = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"|[^\s;]+', re.S)
 _CODESET_RE = re.compile(rb"^//\s*Codeset:\s*(\S+)", re.I | re.M)
+# Text encodings a scene header may name.  Anything else ("undefined", "hex", "rot13"...)
+# is a codec that does not decode text, and is not taken from a file's say-so.
+_CODESET_NAME_RE = re.compile(
+    r"^(?:cp\d{3,5}|ms\d{3,4}|windows-\d{3,4}|utf-?8|ascii|us-ascii|latin-?1|iso-?8859-\d{1,2}|gbk|gb2312|gb18030|"
+    r"big5(?:hkscs)?|shift[-_]?jis|sjis|euc[-_]?(?:jp|kr|cn|tw)|johab|koi8-[ru]|mac[-_]?roman)$")
 
-_SEMICOLON, _SLASH, _STAR = 0x3B, 0x2F, 0x2A
+_SEMICOLON, _SLASH, _STAR, _QUOTE, _BACKSLASH = 0x3B, 0x2F, 0x2A, 0x22, 0x5C
+_BRACES = frozenset(b"{}")
 _NAME_START = frozenset(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_")
 _NAME_BYTES = _NAME_START | frozenset(b"0123456789")
 
@@ -54,6 +60,45 @@ class Statement(object):
         self.inline_code = False
 
 
+def _string_end(data, start):
+    """The offset just past the string literal that opens at ``start``, or -1 if it never closes.
+
+    Matches what _STRING_RE matches, by looking for the next quote and counting the
+    backslashes in front of it.  The regular expression needs a stack frame for every
+    escape in the string, which is gigabytes for a string made of nothing else.
+    """
+    find = data.find
+    pos = start + 1
+    while True:
+        quote = find(b'"', pos)
+        if quote < 0:
+            return -1
+        back = quote
+        while back > start + 1 and data[back - 1] == _BACKSLASH:
+            back -= 1
+        if (quote - back) % 2 == 0:   # an even run of backslashes escapes itself, not the quote
+            return quote + 1
+        pos = quote + 1
+
+
+def _skip_gap(data, pos, size):
+    """The offset of the next thing that is neither white space nor a comment."""
+    find = data.find
+    while True:
+        pos = _SPACE_RE.match(data, pos).end()
+        if pos + 1 < size and data[pos] == _SLASH:
+            following = data[pos + 1]
+            if following == _SLASH:
+                end = find(b"\n", pos)
+                pos = size if end < 0 else end
+                continue
+            if following == _STAR:
+                end = find(b"*/", pos + 2)
+                pos = size if end < 0 else end + 2
+                continue
+        return pos
+
+
 def iter_statements(data):
     """Yield the statements of a .ma held in bytes or an mmap.
 
@@ -70,11 +115,21 @@ def iter_statements(data):
     pos = 3 if data[:3] == b"\xef\xbb\xbf" else 0
     next_semicolon = next_quote = next_slash = next_backtick = next_dollar = next_paren = -1
     while True:
-        pos = _GAP_RE.match(data, pos).end()
+        pos = _skip_gap(data, pos, size)
         if pos >= size:
             return
-        if data[pos] == _SEMICOLON:  # an empty statement
+        first_byte = data[pos]
+        if first_byte == _SEMICOLON:  # an empty statement
             pos += 1
+            continue
+        if first_byte in _BRACES or first_byte == _QUOTE:
+            # Not the start of a command.  It is a statement of its own, so that it cannot
+            # reach forward to the next semicolon and take a real statement with it.
+            closing = _string_end(data, pos) if first_byte == _QUOTE else -1
+            statement = Statement(data[pos:pos + 1], pos)
+            statement.end = closing if closing > 0 else pos + 1
+            yield statement
+            pos = statement.end
             continue
         match = _COMMAND_RE.match(data, pos)
         statement = Statement(match.group(0) if match else data[pos:pos + 1], pos)
@@ -112,9 +167,9 @@ def iter_statements(data):
                 statement.end = first + 1
                 break
             if first == next_quote:
-                literal = _STRING_RE.match(data, first)
-                if literal:
-                    cursor = literal.end()
+                closing = _string_end(data, first)
+                if closing > 0:
+                    cursor = closing
                     statement.literals.append(data[first + 1:cursor - 1])
                 else:
                     cursor = first + 1     # a quote that never closes
@@ -165,16 +220,25 @@ class _Decoder(object):
             return
         if name.isdigit():
             name = "cp" + name
-        if name not in self.encodings:
+        if name not in self.encodings and _CODESET_NAME_RE.match(name):
             self.encodings.insert(1, name)
 
     def __call__(self, data):
         for encoding in self.encodings:
             try:
                 return data.decode(encoding)
-            except (UnicodeDecodeError, LookupError):
+            except (UnicodeError, LookupError):
                 continue
         return data.decode("latin-1")
+
+    @classmethod
+    def for_file(cls, data):
+        """A decoder that honours the //Codeset: line of a scene, as Maya does."""
+        decoder = cls()
+        codeset = _CODESET_RE.search(data[:2048])
+        if codeset:
+            decoder.set_codeset(codeset.group(1))
+        return decoder
 
 
 def plug_node(reference):
@@ -191,10 +255,11 @@ def _flag_value(args, *flags):
 
 
 def _parse_create_node(args):
-    """(type, name, shared) from createNode's arguments, in whatever order they come."""
+    """(type, name, shared, selected) from createNode's arguments, in whatever order they come."""
     node_type = b""
     name = b""
     shared = False
+    selected = True
     index = 1
     while index < len(args):
         token = args[index]
@@ -206,12 +271,14 @@ def _parse_create_node(args):
             index += 2
         elif token.startswith(b"-"):
             shared = shared or token in (b"-s", b"-shared")
+            if token in (b"-ss", b"-skipSelect"):
+                selected = False
             index += 1
         else:
             if not node_type:
                 node_type = token.strip(b'"')
             index += 1
-    return node_type, name, shared
+    return node_type, name, shared, selected
 
 
 def _parse_set_attr(args, literals):
@@ -283,11 +350,16 @@ class _SceneBuilder(object):
         self.contiguous = False
 
     def create_node(self, statement, extent):
-        node_type, name, shared = _parse_create_node(self.args_of(statement))
+        node_type, name, shared, selected = _parse_create_node(self.args_of(statement))
         node = NodeRecord(node_type.decode("latin-1"), self.decoder(name), None, statement.start, shared=shared)
         node.extents.append(extent)
         self.doc.nodes.append(node)
         self.by_name[node.name.lstrip(":")] = node
+        if not selected:
+            # createNode -skipSelect leaves the selection where it was: the setAttr lines
+            # that follow still belong to the node selected before.
+            self.contiguous = False
+            return
         self.current = node
         self.contiguous = True
 
@@ -376,9 +448,7 @@ def parse_ma(path):
 
     try:
         with _MappedFile(path) as data:
-            codeset = _CODESET_RE.search(data[:2048])
-            if codeset:
-                decoder.set_codeset(codeset.group(1))
+            decoder = _Decoder.for_file(data)
 
             def args_of(statement):
                 end = min(statement.end, statement.start + _ARGS_WINDOW)
@@ -484,12 +554,16 @@ def rewrite_ma(source, destination, extents, removed_nodes):
     ranges = list(extents)
     links = 0
     wanted = set(name.lstrip(":") for name in removed_nodes)
-    decoder = _Decoder()
+    wanted.discard("")   # an unnamed node must not match every plug without a node part
     with _MappedFile(source) as data:
+        decoder = _Decoder.for_file(data)   # names were read with the file's codeset; compare the same way
         if wanted:
             for statement in iter_statements(data):
                 if statement.command in _LINK_COMMANDS:
-                    for literal in statement.literals:
+                    # relationship "link" ":lightLinker1" ...: the first word says what kind of
+                    # relationship it is.  It is not a node, even if a node is called "link".
+                    literals = statement.literals[1:] if statement.command == b"relationship" else statement.literals
+                    for literal in literals:
                         if plug_node(decoder(literal)) in wanted:
                             ranges.append((statement.start, statement.end))
                             links += 1

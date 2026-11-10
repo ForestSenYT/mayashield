@@ -174,7 +174,7 @@ TEXT_RULES = tuple(
         ("startup_l10n", "persistence", 60, r"animImportExport\.pres\.mel|resources[\\/]+l10n"),
         ("app_dir_probe", "persistence", 15,
          r"internalVar\s*\(?[^;\n]{0,40}?\b(?:userAppDir|userScriptDir|uad|usd)\b"),
-        ("force_quit", "destructive", 35, r"\bquit\s+-f(?:orce)?\b|\bquit\s*\([^)]*\b(?:f|force)\s*=\s*True"),
+        ("force_quit", "destructive", 35, r"\bquit\s+-f(?:orce)?\b|\bquit\s*\([^)]{0,400}\b(?:f|force)\s*=\s*True"),
         ("date_trigger", "trigger", 15, r"\babout\s+-(?:cd|currentDate)\b"),
     )
 )
@@ -185,7 +185,7 @@ MEL_RULES = tuple(
         ("mel_system", "process", 45, r"(?<![\w.$])system\s*(?:\(|\")"),
         ("mel_exec", "process", 30, r"(?<![\w.$])exec\s*\("),
         ("mel_python", "execution", 10, r"(?<![\w.$])python\s*\("),
-        ("mel_eval_dynamic", "execution", 20, r"(?<![\w.$])eval\s*\(?\s*\$"),
+        ("mel_eval_dynamic", "execution", 20, r"(?<![\w.$])eval\s*(?:\(\s*)?\$"),
         ("mel_file_write", "filesystem", 15, r"(?<![\w.$])(?:fopen|fprint|fwrite)\b"),
         ("mel_sysfile", "filesystem", 30, r"\bsysFile\s+-(?:delete|del|rename|ren|copy|cp|move|mov)\b"),
         # Creating a node that carries code.  Running an existing one (-eb/-ea) is
@@ -215,8 +215,8 @@ PY_FALLBACK_RULES = tuple(
         ("py_network", "network", 40, r"\burllib\d?\b|\brequests\s*\.\s*(?:get|post)\b|\bsocket\s*\.\s*socket\b|\bftplib\b"),
         ("py_scriptjob", "trigger", 20, r"\bscriptJob\s*\("),
         ("py_scriptnode", "replication", 30,
-         r"\bscriptNode\s*\([^)]*\b(?:bs|beforeScript|afterScript)\s*=|\bcreateNode\s*\(\s*[\"']script[\"']"),
-        ("py_scene_save", "replication", 15, r"\bcmds\s*\.\s*file\s*\([^)]*\b(?:save|s)\s*=\s*True"),
+         r"\bscriptNode\s*\([^)]{0,400}\b(?:bs|beforeScript|afterScript)\s*=|\bcreateNode\s*\(\s*[\"']script[\"']"),
+        ("py_scene_save", "replication", 15, r"\bcmds\s*\.\s*file\s*\([^)]{0,400}\b(?:save|s)\s*=\s*True"),
     )
 )
 

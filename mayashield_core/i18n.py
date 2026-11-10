@@ -458,6 +458,7 @@ RULE_TEXT = {
     "py_too_large": ("Unusually large script", u"脚本异常地大"),
     "py_too_complex": ("Code nested too deeply to read", u"代码嵌套太深，无法分析"),
     "oversized_script": ("Unusually large script", u"脚本异常地大"),
+    "analysis_budget": ("Wrapped in more layers than any normal script needs", u"包了太多层，正常脚本用不着这样"),
     "many_blobs": ("Many encoded-looking strings", u"有很多像编码数据的字符串"),
     "opaque_blob": ("Large block of unreadable data", u"有大块无法识别的数据"),
     "startup_usersetup": ("Mentions Maya's startup script (userSetup)", u"提到了 Maya 的启动脚本 userSetup"),

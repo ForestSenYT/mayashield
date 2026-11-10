@@ -102,9 +102,10 @@ def assess_node(node):
             "families": [family] if family else [],
         })
 
-    for attr, value in node.strings.items():
+    for key, value in node.strings.items():
         if not value:
             continue
+        attr = key.split("<nested:", 1)[0]   # see mb_parser: read like its attribute, never removed for it
         if is_script and attr in _SCRIPT_ATTRS:
             result = analyzer.analyze_text(value, lang=_script_language(node), context=analyzer.CONTEXT_SCRIPT)
         elif is_expression and attr in _EXPRESSION_ATTRS:
@@ -118,7 +119,7 @@ def assess_node(node):
             result = analyzer.analyze_attr(value)
         if result["evidence"]:
             results.append(result)
-            if result["score"] >= rules.RISK_LOW:
+            if result["score"] >= rules.RISK_LOW and key == attr:
                 flagged.append(attr)
                 attr_scores[attr] = result["score"]
 
@@ -203,8 +204,12 @@ def _assess_anomaly(anomaly):
     return analyzer.merge_analyses(results)
 
 
-def build_report(doc):
-    """Turn a parsed SceneDoc into hits.  Also returns the removal plan."""
+def build_report(doc, deadline=None):
+    """Turn a parsed SceneDoc into hits.  Also returns the removal plan.
+
+    With a deadline (a time.time() value), nodes still waiting when it passes are not
+    analysed and the document is marked as not fully read.
+    """
     hits = []
     offsets = []
     plan = {"nodes": [], "attrs": [], "extents": []}
@@ -226,7 +231,16 @@ def build_report(doc):
              "detail": "Could not be fully analyzed: %s" % doc.parse_note}]}
         hits.append(_hit("structure", analysis))
 
-    for node in doc.nodes:
+    for index, node in enumerate(doc.nodes):
+        if deadline is not None and index % 32 == 0 and time.time() > deadline:
+            doc.parse_ok = False
+            doc.parse_note = "Stopped: %d of %d nodes were still to be analysed when the time allowed ran out." % (
+                len(doc.nodes) - index, len(doc.nodes))
+            analysis = {"score": 45, "families": [], "evidence": [
+                {"rule": "not_fully_analyzed", "category": "structure", "weight": 45,
+                 "detail": "Could not be fully analyzed: %s" % doc.parse_note}]}
+            hits.append(_hit("structure", analysis))
+            break
         analysis, kind, flagged = assess_node(node)
         if analysis is None or analysis["score"] < rules.RISK_LOW:
             continue
@@ -328,8 +342,12 @@ def scan_script_file(path):
     return report
 
 
-def scan_file(path, report_path=None, deep=False, timeout_sec=120, mayapy=None):
-    """Scan one scene.  Returns the report dict (see the README for the schema)."""
+def scan_file(path, report_path=None, deep=False, timeout_sec=120, mayapy=None, time_limit=None):
+    """Scan one scene.  Returns the report dict (see the README for the schema).
+
+    ``time_limit`` (seconds) is for callers that must not hang, such as the check Maya
+    waits on before it opens a file: past it the scan stops and says it is incomplete.
+    """
     started = time.time()
     target = os.path.abspath(path)
     report = {
@@ -350,7 +368,8 @@ def scan_file(path, report_path=None, deep=False, timeout_sec=120, mayapy=None):
         report["type"] = doc.type
         report["parse_ok"] = doc.parse_ok
         report["references"] = doc.references[:200]
-        report["hits"], _plan = build_report(doc)
+        report["hits"], _plan = build_report(doc, deadline=started + time_limit if time_limit else None)
+        report["parse_ok"] = doc.parse_ok
         if not doc.parse_ok:
             report["note"] = doc.parse_note
     except Exception as error:  # A crafted file must never take the scanner down.

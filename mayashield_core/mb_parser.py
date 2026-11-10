@@ -115,13 +115,16 @@ def _walk_node(data, node, body, end, wide, depth=0):
             if size <= _MAX_STRING:
                 attr, rest = _split_attr(bytes(data[child_body:child_body + size]))
                 if attr is not None:
+                    # Only direct children can be cut out: the rewriter patches the sizes of
+                    # the node group and the root, nothing between.  A value found deeper is
+                    # kept under a name of its own, so it is analysed but can never stand in
+                    # for the direct child that would be the one removed.
+                    key = attr if depth == 0 else "%s<nested:%d>" % (attr, len(node.strings))
                     if tag == b"STR#":
                         parts = rest[4:].split(b"\x00")
-                        node.strings[attr] = "\n".join(_decode(part) for part in parts if part)
+                        node.strings[key] = "\n".join(_decode(part) for part in parts if part)
                     else:
-                        node.strings[attr] = _decode(rest.rstrip(b"\x00"))
-                    # Only direct children can be cut out: the rewriter patches
-                    # the sizes of the node group and the root, nothing between.
+                        node.strings[key] = _decode(rest.rstrip(b"\x00"))
                     if depth == 0:
                         node.attr_extents.setdefault(attr, []).append((pos, next_pos))
             else:
@@ -148,11 +151,15 @@ def _names_in_link(tag, payload):
     if tag == b"CWFL":
         payload = payload[1:]  # leading flag byte
     names = set()
-    for piece in payload.split(b"\x00"):
+    pieces = payload.split(b"\x00")
+    if tag == b"RELA":
+        pieces = pieces[1:]    # the kind of relationship ("link", "shadowLink"), not a node
+    for piece in pieces:
         text = piece.lstrip(bytes(bytearray(range(32))))
         if text:
             head = _decode(text).split(".", 1)[0]
             names.add(head.rsplit("|", 1)[-1].lstrip(":"))
+    names.discard("")
     return names
 
 
@@ -302,6 +309,7 @@ def rewrite_mb(source, destination, doc, drop_nodes, drop_attr_extents=()):
     """
     layout = doc.layout
     wanted = set(node.name.lstrip(":") for node in drop_nodes)
+    wanted.discard("")
     drops = []       # (start, end, ancestor chain)
     links = 0
 

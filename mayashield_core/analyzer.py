@@ -20,7 +20,7 @@ import re
 import sys
 import zlib
 
-from . import rules
+from . import pyguard, rules
 
 MAX_TEXT = 8 * 1024 * 1024
 MAX_PY_PARSE = 2 * 1024 * 1024
@@ -28,6 +28,11 @@ MAX_DEPTH = 4
 MAX_BLOBS = 64
 MAX_BLOB_BYTES = 32 * 1024 * 1024
 MAX_DECODED = 8 * 1024 * 1024
+# Limits on the work one script may cause, however it is written.  Without them a few
+# hundred bytes could keep the scanner (and so Maya, opening the scene) busy for minutes.
+MAX_FOLDED = 64 * 1024            # longest string the constant folder will build
+MAX_FOLDED_TOTAL = 4 * 1024 * 1024
+MAX_NESTED_ANALYSES = 200         # analyses of strings found inside one script, at any depth
 
 CONTEXT_SCRIPT = "script"       # script node / expression / injected statement
 CONTEXT_ATTR = "attr"           # plain string attribute on some other node
@@ -46,13 +51,18 @@ _SCALE_EXEMPT = {
 
 _B64_RE = re.compile(r"[A-Za-z0-9+/_-]{32,}={0,2}")
 _HEX_RE = re.compile(r"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}){16,}(?![0-9A-Fa-f])")
-_PY_HINT_RE = re.compile(r"^\s*(?:import\s+\w|from\s+\w+\s+import|def\s+\w+\s*\(|class\s+\w+|try\s*:|exec\s*\()", re.M)
-_MEL_HINT_RE = re.compile(r"\$\w+|^\s*(?:global\s+)?proc\s|;\s*$|`", re.M)
-_MEL_PY_CALL_RE = re.compile(r"(?<![\w.$])python\s*\(\s*\"((?:[^\"\\]|\\.)*)\"", re.S)
-_MEL_COMMENT_RE = re.compile(r"\"(?:[^\"\\]|\\.)*\"|//[^\n]*|/\*.*?\*/", re.S)
-_MEL_STRING_RE = re.compile(r"\"((?:[^\"\\]|\\.)*)\"", re.S)
+# These run over whole scripts, so their cost has to grow with the length of the text
+# and no faster.  Line-anchored ones skip blanks with [ \t]*, not \s* (which also eats
+# the newlines and so retries every blank line from every earlier one); a comment that
+# never closes ends at the end of the text; strings are written "unrolled", which
+# matches the same text as (?:[^"\\]|\\.)* without a regex stack frame per character.
+_PY_HINT_RE = re.compile(r"^[ \t]*(?:import\s+\w|from\s+\w+\s+import|def\s+\w+\s*\(|class\s+\w+|try\s*:|exec\s*\()", re.M)
+_MEL_HINT_RE = re.compile(r"\$\w+|^[ \t]*(?:global\s+)?proc\s|;[ \t]*$|`", re.M)
+_MEL_PY_CALL_RE = re.compile(r"(?<![\w.$])python\s*\(\s*\"([^\"\\]*(?:\\.[^\"\\]*)*)\"", re.S)
+_MEL_COMMENT_RE = re.compile(r"\"[^\"\\]*(?:\\.[^\"\\]*)*\"|//[^\n]*|/\*.*?(?:\*/|\Z)", re.S)
+_MEL_STRING_RE = re.compile(r"\"([^\"\\]*(?:\\.[^\"\\]*)*)\"", re.S)
 _MEL_CONCAT_RE = re.compile(r"\"\s*\+\s*\"")
-_PY_COMMENT_RE = re.compile(r"^\s*#[^\n]*$", re.M)
+_PY_COMMENT_RE = re.compile(r"^[ \t]*#[^\n]*$", re.M)
 
 
 def combine(weights):
@@ -95,6 +105,28 @@ class _Collector(object):
 
     def has(self, rule):
         return rule in self.items
+
+
+class _Budget(object):
+    """How much more work one top-level script may still cause.
+
+    Strings inside strings and blobs inside blobs are each analysed in turn.  Every
+    step is small, but a few hundred bytes can ask for millions of them, so there is
+    one allowance for the whole tree, not one per level.
+    """
+
+    def __init__(self):
+        self.analyses = MAX_NESTED_ANALYSES
+        self.decoded = MAX_BLOB_BYTES * 2
+        self.exhausted = False
+
+    def take(self, decoded_bytes=0):
+        if self.analyses <= 0 or self.decoded < decoded_bytes:
+            self.exhausted = True
+            return False
+        self.analyses -= 1
+        self.decoded -= decoded_bytes
+        return True
 
 
 def _snippet(text, match):
@@ -165,9 +197,16 @@ class _PyAnalyzer(ast.NodeVisitor):
         self.aliases = {}
         self.constants = {}
         self.folded = []
+        self.folded_size = 0
         self.literals = []
         self.chr_calls = 0
         self.nested_code = []
+
+    def keep_folded(self, value):
+        """Remember a string the code builds, within a total allowance for the script."""
+        if value and self.folded_size + len(value) <= MAX_FOLDED_TOTAL:
+            self.folded_size += len(value)
+            self.folded.append(value)
 
     # ------ name resolution ------
     def visit_Import(self, node):
@@ -196,8 +235,7 @@ class _PyAnalyzer(ast.NodeVisitor):
         """A string built at runtime is checked as the string it becomes."""
         value = self.fold(node)
         if isinstance(value, (str, bytes)):
-            if value:
-                self.folded.append(value)
+            self.keep_folded(value)
             return
         self.generic_visit(node)
 
@@ -240,7 +278,8 @@ class _PyAnalyzer(ast.NodeVisitor):
             return self.constants.get(node.id)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             left, right = self.fold(node.left), self.fold(node.right)
-            if isinstance(left, type(right)) and isinstance(left, (str, bytes)):
+            # Capped: `a = a + a` on every line would otherwise double a string without end.
+            if isinstance(left, type(right)) and isinstance(left, (str, bytes)) and len(left) + len(right) <= MAX_FOLDED:
                 return left + right
             return None
         if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
@@ -265,7 +304,8 @@ class _PyAnalyzer(ast.NodeVisitor):
             arg = node.args[0]
             if isinstance(sep, str) and isinstance(arg, (ast.List, ast.Tuple)):
                 parts = [self.fold(item) for item in arg.elts]
-                if all(isinstance(part, str) for part in parts):
+                if all(isinstance(part, str) for part in parts) \
+                        and sum(len(part) for part in parts) + len(sep) * len(parts) <= MAX_FOLDED:
                     return sep.join(parts)
             return None
         if isinstance(node.func, ast.Attribute) and node.func.attr == "decode":
@@ -354,8 +394,8 @@ class _PyAnalyzer(ast.NodeVisitor):
                 self.out.add("py_mel_eval_dynamic", "execution", 15, "mel.eval of a computed string")
 
         folded = self.fold(node)
-        if isinstance(folded, (str, bytes)) and folded:
-            self.folded.append(folded)
+        if isinstance(folded, (str, bytes)):
+            self.keep_folded(folded)
         self.generic_visit(node)
 
     def _check_call_table(self, name, node):
@@ -406,6 +446,9 @@ class _PyAnalyzer(ast.NodeVisitor):
         if isinstance(node.s, str):
             self.literals.append(node.s)
 
+    def visit_Bytes(self, node):  # Python 3.7
+        self.literals.append(node.s.decode("latin-1"))
+
     def visit_Constant(self, node):
         if isinstance(node.value, str):
             self.literals.append(node.value)
@@ -413,11 +456,16 @@ class _PyAnalyzer(ast.NodeVisitor):
             self.literals.append(node.value.decode("latin-1"))
 
 
-def _analyze_python(text, out, context, depth):
+def _analyze_python(text, out, context, depth, budget):
     if len(text) > MAX_PY_PARSE:
         _apply_rules(text, rules.PY_FALLBACK_RULES, out)
         if context == CONTEXT_SCRIPT:
             out.add("py_too_large", "obfuscation", 25, "%d characters of Python in one script" % len(text))
+        return
+    if pyguard.needs_guard(text):
+        # Python before 3.11 overflows its C stack on this and takes the process with it.
+        out.add("py_too_complex", "obfuscation", 40, "Code nested too deeply to analyze")
+        _apply_rules(_PY_COMMENT_RE.sub("", text), rules.PY_FALLBACK_RULES, out)
         return
     try:
         tree = ast.parse(text)
@@ -434,28 +482,28 @@ def _analyze_python(text, out, context, depth):
     for statement in tree.body:
         try:
             visitor.visit(statement)
-        except RecursionError:
+        except (RecursionError, MemoryError):
             out.add("py_too_complex", "obfuscation", 40, "Code nested too deeply to analyze")
             _apply_rules(_PY_COMMENT_RE.sub("", text), rules.PY_FALLBACK_RULES, out)
     if visitor.chr_calls >= 16:
         out.add("py_chr_obfuscation", "obfuscation", 30, "%d chr() calls" % visitor.chr_calls)
 
     for lang, code in visitor.nested_code:
-        if depth < MAX_DEPTH:
-            out.merge(analyze_text(code, lang=lang, context=context, _depth=depth + 1), "nested: ")
+        if depth < MAX_DEPTH and budget.take():
+            out.merge(analyze_text(code, lang=lang, context=context, _depth=depth + 1, _budget=budget), "nested: ")
     for piece in visitor.folded:
         if isinstance(piece, bytes):
             piece = piece.decode("utf-8", "replace")
         if len(piece) >= 6 and depth < MAX_DEPTH:
             _sweep_family(piece, out)
             _apply_rules(piece, rules.TEXT_RULES, out)
-            if rules.CODE_HINT_RE.search(piece):
-                out.merge(analyze_text(piece, context=context, _depth=depth + 1), "computed string: ")
+            if rules.CODE_HINT_RE.search(piece) and budget.take():
+                out.merge(analyze_text(piece, context=context, _depth=depth + 1, _budget=budget), "computed string: ")
     for literal in visitor.literals:
         _apply_rules(literal, rules.TEXT_RULES, out)
         # Code in a string: evalDeferred("..."), scriptJob(event=[..., "..."]) and so on.
-        if depth < MAX_DEPTH and len(literal) <= MAX_PY_PARSE and rules.CODE_HINT_RE.search(literal):
-            out.merge(analyze_text(literal, context=context, _depth=depth + 1), "in a string: ")
+        if depth < MAX_DEPTH and len(literal) <= MAX_PY_PARSE and rules.CODE_HINT_RE.search(literal) and budget.take():
+            out.merge(analyze_text(literal, context=context, _depth=depth + 1, _budget=budget), "in a string: ")
 
 
 # ---------------------------------------------------------------------------
@@ -511,15 +559,19 @@ def _entropy(text):
     return -sum((n / total) * math.log(n / total, 2) for n in counts.values()) if total else 0.0
 
 
-def _analyze_blobs(text, out, context, depth):
+def _analyze_blobs(text, out, context, depth, shared):
     seen = 0
     budget = MAX_BLOB_BYTES
+    done = set()
     candidates = [(m, "base64") for m in _B64_RE.finditer(text)] + [(m, "hex") for m in _HEX_RE.finditer(text)]
     candidates.sort(key=lambda item: -len(item[0].group(0)))
     if len(candidates) > MAX_BLOBS and context == CONTEXT_SCRIPT:
         out.add("many_blobs", "obfuscation", 25, "%d encoded-looking strings in one script" % len(candidates))
     for match, kind in candidates[:MAX_BLOBS]:
         blob = match.group(0)
+        if (kind, blob) in done:
+            continue   # the same blob a second time says nothing new
+        done.add((kind, blob))
         budget -= len(blob)
         if budget < 0:
             break
@@ -544,12 +596,15 @@ def _analyze_blobs(text, out, context, depth):
             probe = raw.decode("latin-1")
             before = len(out.items)
             _sweep_family(probe, out)
+            found_family = len(out.items) > before   # asked before anything else is added
             if context == CONTEXT_SCRIPT and len(blob) >= 200:
                 out.add("opaque_blob", "obfuscation", 25, "%d char %s blob with binary content" % (len(blob), kind))
-            if len(out.items) > before:
+            if found_family:
                 out.add("encoded_payload", "obfuscation", 35, "family string inside a %s blob" % layers)
             continue
-        inner = analyze_text(decoded, context=context, _depth=depth + 1)
+        if not shared.take(len(decoded)):
+            break
+        inner = analyze_text(decoded, context=context, _depth=depth + 1, _budget=shared)
         if inner["evidence"]:
             out.merge(inner, "in decoded %s: " % layers)
             out.add("encoded_payload", "obfuscation", 35, "behaviour hidden inside a %s blob" % layers)
@@ -583,11 +638,12 @@ def _finish(out, context):
             "families": list(out.families)}
 
 
-def analyze_text(text, lang=None, context=CONTEXT_SCRIPT, _depth=0):
+def analyze_text(text, lang=None, context=CONTEXT_SCRIPT, _depth=0, _budget=None):
     """Analyse one script or string.  Returns {score, evidence, families}."""
     out = _Collector()
     if not text:
         return {"score": 0, "evidence": [], "families": []}
+    budget = _budget if _budget is not None else _Budget()
 
     # Family markers are looked for in everything, before any size limit applies.
     _sweep_family(text, out)
@@ -600,7 +656,7 @@ def analyze_text(text, lang=None, context=CONTEXT_SCRIPT, _depth=0):
         lang = _guess_language(text)
 
     if lang == "python":
-        _analyze_python(text, out, context, _depth)
+        _analyze_python(text, out, context, _depth, budget)
         code_text = _PY_COMMENT_RE.sub("", text)
     else:
         # "a" + "b" is one string by the time MEL uses it.
@@ -608,23 +664,34 @@ def analyze_text(text, lang=None, context=CONTEXT_SCRIPT, _depth=0):
         _apply_rules(code_text, rules.MEL_RULES, out)
         if _depth < MAX_DEPTH:
             for match in _MEL_PY_CALL_RE.finditer(code_text):
+                if not budget.take():
+                    break
                 body = mel_unescape(match.group(1))
-                out.merge(analyze_text(body, lang="python", context=context, _depth=_depth + 1), "python(): ")
+                out.merge(analyze_text(body, lang="python", context=context, _depth=_depth + 1, _budget=budget),
+                          "python(): ")
             # Any string could reach python(), eval or evalDeferred through a variable,
             # so a string that looks like code is read as both languages.
             for match in _MEL_STRING_RE.finditer(code_text):
                 body = mel_unescape(match.group(1))
                 if rules.CODE_HINT_RE.search(body):
-                    out.merge(analyze_text(body, lang="python", context=context, _depth=_depth + 1), "in a string: ")
-                    out.merge(analyze_text(body, lang="mel", context=context, _depth=_depth + 1), "in a string: ")
+                    if not budget.take():
+                        break
+                    out.merge(analyze_text(body, lang="python", context=context, _depth=_depth + 1, _budget=budget),
+                              "in a string: ")
+                    out.merge(analyze_text(body, lang="mel", context=context, _depth=_depth + 1, _budget=budget),
+                              "in a string: ")
 
     _apply_rules(code_text, rules.TEXT_RULES, out)
     if rules.CONFIRM_DIALOG_RE.search(code_text):
         out.add("confirm_dialog", "destructive", 0, "confirmDialog")
     if _depth < MAX_DEPTH:
-        _analyze_blobs(text, out, context, _depth)
+        _analyze_blobs(text, out, context, _depth, budget)
+    if _depth == 0 and budget.exhausted:
+        out.add("analysis_budget", "obfuscation", 25, "More layers of strings and encoded data than a script has any use for")
     _apply_combos(out)
-    return _finish(out, context)
+    # Weights are scaled for the context once, at the top.  What a nested string
+    # contributed has to weigh the same however deep it was found.
+    return _finish(out, context if _depth == 0 else None)
 
 
 def analyze_attr(text):
@@ -638,7 +705,7 @@ def analyze_attr(text):
         if any(item["weight"] >= rules.RISK_LOW for item in out.items.values()):
             out.add("hidden_payload", "obfuscation", 25, "executable code stored in a data attribute")
     elif len(text) >= 256:
-        _analyze_blobs(text, out, CONTEXT_ATTR, 0)
+        _analyze_blobs(text, out, CONTEXT_ATTR, 0, _Budget())
     _apply_combos(out)
     return _finish(out, CONTEXT_ATTR)
 
