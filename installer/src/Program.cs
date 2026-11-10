@@ -33,6 +33,7 @@ namespace MayaShieldSetup
         public string ElevatedPipe;                 // internal: where the elevated copy sends its log
         public readonly List<KeyValuePair<int, string>> Targets = new List<KeyValuePair<int, string>>();
         public string TestRoot;                     // tests only: see Engine.TestRoot
+        public int StartupGrace = 120;              // seconds a Maya with no window yet is taken to be starting; tests shorten it
         public string RelayFile;                    // internal: this is the temporary copy doing an uninstall
         public int WaitPid;                         // internal: the registered copy that started it
 
@@ -96,6 +97,9 @@ namespace MayaShieldSetup
                         case "--test-root": o.TestRoot = Path.GetFullPath(next); break;
                         case "--wait-pid":
                             if (!int.TryParse(next, out o.WaitPid)) { error = arg + " " + next; return null; }
+                            break;
+                        case "--startup-grace":
+                            if (!int.TryParse(next, out o.StartupGrace) || o.StartupGrace < 0) { error = arg + " " + next; return null; }
                             break;
                         case "--maya":
                         case "--target":
@@ -221,9 +225,10 @@ namespace MayaShieldSetup
                 List<MayaInstall> all = o.Uninstall ? Maya.WithModule(o) : Maya.Detect(o);
                 foreach (MayaInstall maya in all)
                     report.Log(L.T("found", maya.Version, maya.Path));
-                if (!o.Force && Maya.IsRunning())
+                if (!o.Force && Maya.Blocking(o, report).Count > 0)
                 {
                     report.Log(L.T("mayaRunningLog"));
+                    report.Log(L.T("mayaRunningHint"));
                     return Exit.MayaRunning;
                 }
                 if (o.Uninstall)

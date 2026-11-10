@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
@@ -18,6 +19,97 @@ namespace MayaShieldSetup
         public string Installed; // MayaShield version already in this Maya's modules folder, or null
 
         public string OldCopyPath { get { return System.IO.Path.Combine(Path, "bin", "plug-ins", "mayashield.py"); } }
+    }
+
+    enum MayaProcessKind
+    {
+        Open,       // shows a window on this desktop: somebody is using it
+        Starting,   // no window yet, but it has only just started
+        Batch,      // mayabatch: never has a window, and may be in the middle of a render
+        Elsewhere,  // another Windows session, whose windows cannot be seen from here
+        Leftover,   // lost its window and never exited
+    }
+
+    class MayaProcess
+    {
+        public int Id;
+        public string Name;         // "maya" or "mayabatch"
+        public string Title = "";   // of the window it shows, when it shows one
+        public DateTime? Started;
+        public MayaProcessKind Kind;
+
+        /// <summary>Only a process with nothing on screen, and nothing on the way, is passed over.</summary>
+        public bool Blocks { get { return Kind != MayaProcessKind.Leftover; } }
+
+        public string Describe()
+        {
+            switch (Kind)
+            {
+                case MayaProcessKind.Open: return L.T("procOpen", Title.Length > 0 ? Title : Name + ".exe", Id);
+                case MayaProcessKind.Starting: return L.T("procStarting", Id);
+                case MayaProcessKind.Batch: return L.T("procBatch", Name + ".exe", Id);
+                case MayaProcessKind.Elsewhere: return L.T("procElsewhere", Id);
+                default: return L.T("procLeftover", Id, Started == null ? "?" : Started.Value.ToString("yyyy-MM-dd HH:mm"));
+            }
+        }
+    }
+
+    /// <summary>What is on screen, asked of Windows directly.</summary>
+    static class Desktop
+    {
+        delegate bool EnumWindowsProc(IntPtr window, IntPtr parameter);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
+
+        [DllImport("user32.dll")]
+        static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool IsWindowVisible(IntPtr window);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern int GetWindowText(IntPtr window, StringBuilder text, int capacity);
+
+        /// <summary>
+        /// Process id to the title of a window that process shows, for every process showing
+        /// one.  A minimised window counts as shown; a window that exists but was never put on
+        /// screen does not.  Null when the desktop cannot be looked at, as for a service.
+        /// </summary>
+        public static Dictionary<int, string> VisibleWindows()
+        {
+            var found = new Dictionary<int, string>();
+            EnumWindowsProc each = delegate(IntPtr window, IntPtr unused)
+            {
+                if (!IsWindowVisible(window))
+                    return true;
+                uint id;
+                GetWindowThreadProcessId(window, out id);
+                var text = new StringBuilder(256);
+                GetWindowText(window, text, text.Capacity);
+                string title = text.ToString();
+                string known;
+                // Maya shows several windows; the one with its name in the title is the one to quote.
+                if (!found.TryGetValue((int)id, out known) || known.Length == 0
+                    || (title.IndexOf("maya", StringComparison.OrdinalIgnoreCase) >= 0
+                        && known.IndexOf("maya", StringComparison.OrdinalIgnoreCase) < 0))
+                    found[(int)id] = title;
+                return true;
+            };
+            bool listed;
+            try
+            {
+                listed = EnumWindows(each, IntPtr.Zero);
+            }
+            catch (Exception)
+            {
+                listed = false;
+            }
+            GC.KeepAlive(each);
+            return listed && found.Count > 0 ? found : null;
+        }
     }
 
     static class Maya
@@ -140,18 +232,84 @@ namespace MayaShieldSetup
             }
         }
 
-        /// <summary>A Maya with a window, or a batch render: either may have our files open.</summary>
-        public static bool IsRunning()
+        /// <summary>
+        /// Every maya.exe and mayabatch.exe on this computer, and what each one is.
+        ///
+        /// A process by that name does not by itself mean Maya is open.  A Maya that hangs while
+        /// closing keeps its process for days with nothing on screen, and asking someone to close
+        /// what they cannot see leaves them stuck.  So a Maya counts as open when it shows a
+        /// window; without one it is passed over, unless it started so recently that its window
+        /// is still on the way.  A batch job never has a window and always counts.
+        /// </summary>
+        public static List<MayaProcess> Running(int startupGraceSeconds)
         {
+            var result = new List<MayaProcess>();
+            Dictionary<int, string> windows = Desktop.VisibleWindows();
+            int session = -1;
+            try
+            {
+                using (Process self = Process.GetCurrentProcess())
+                    session = self.SessionId;
+            }
+            catch (Exception) { }
+
             foreach (string name in new[] { "maya", "mayabatch" })
             {
-                Process[] running = Process.GetProcessesByName(name);
-                foreach (Process process in running)
-                    process.Dispose();
-                if (running.Length > 0)
-                    return true;
+                Process[] processes;
+                try
+                {
+                    processes = Process.GetProcessesByName(name);
+                }
+                catch (Exception)
+                {
+                    continue;
+                }
+                foreach (Process process in processes)
+                {
+                    using (process)
+                    {
+                        // Each of these can be refused for a process of another account: what
+                        // cannot be learnt is left at the value that holds Setup back.
+                        bool gone = false;
+                        try { gone = process.HasExited; } catch (Exception) { }
+                        if (gone)
+                            continue;
+                        var found = new MayaProcess { Name = name };
+                        try { found.Id = process.Id; } catch (Exception) { }
+                        try { found.Started = process.StartTime; } catch (Exception) { }
+                        int itsSession = -2;
+                        try { itsSession = process.SessionId; } catch (Exception) { }
+
+                        string title;
+                        if (name == "mayabatch")
+                            found.Kind = MayaProcessKind.Batch;
+                        else if (itsSession != session)
+                            found.Kind = MayaProcessKind.Elsewhere;
+                        else if (windows == null)
+                            found.Kind = MayaProcessKind.Open;      // cannot look, so assume it is in use
+                        else if (windows.TryGetValue(found.Id, out title))
+                        {
+                            found.Kind = MayaProcessKind.Open;
+                            found.Title = title;
+                        }
+                        else if (found.Started != null && (DateTime.Now - found.Started.Value).TotalSeconds < startupGraceSeconds)
+                            found.Kind = MayaProcessKind.Starting;
+                        else
+                            found.Kind = MayaProcessKind.Leftover;
+                        result.Add(found);
+                    }
+                }
             }
-            return false;
+            return result;
+        }
+
+        /// <summary>The processes Setup has to wait for.  Everything found goes into the log, passed over or not.</summary>
+        public static List<MayaProcess> Blocking(Options o, Reporter report)
+        {
+            List<MayaProcess> running = Running(o.StartupGrace);
+            foreach (MayaProcess process in running)
+                report.Log(process.Blocks ? L.T("mayaFound", process.Describe()) : process.Describe());
+            return running.Where(process => process.Blocks).ToList();
         }
 
         /// <summary>First come, first kept, except that a real Maya replaces a leftover folder.</summary>

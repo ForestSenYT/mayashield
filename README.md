@@ -1,12 +1,13 @@
-# MayaShield 4.1.0
+# MayaShield 4.1.1
 
 检测并清除 Maya 场景病毒和启动项感染的插件。支持 Maya 2022 到 2027。
 
 ## 安装
 
-**Windows：** 双击 `dist/MayaShield-4.1.0-Setup.exe`，点“安装”。请先关闭 Maya。
+**Windows：** 双击 `dist/MayaShield-4.1.1-Setup.exe`，点“安装”。请先关闭 Maya。
 
 - 窗口会用一句话说明将要做什么。默认安装到这台电脑上所有受支持的 Maya，供所有用户使用，Windows 会让你确认一次。想只装某几个版本，或者只给自己装（不需要确认），点“自定义”。如果这台电脑已经为所有用户装过 MayaShield，Maya 会一直优先用那一份，只给自己装的不会被加载，安装程序会提示你改选“所有用户”。
+- 安装前会检查 Maya 是不是还开着：带窗口的 Maya 和批处理任务（`mayabatch`）算开着，提示里会写明是哪一个。Maya 关闭时偶尔会留下一个没有窗口的后台进程，安装程序会跳过它。如果你确定 Maya 已经关了却仍被拦住，点“继续”即可。
 - 安装顺利完成后，窗口会在几秒后自动关闭。有需要你留意的情况时窗口会留着，写明原因和该怎么办，并提供“打开日志”按钮。
 - 下次启动 Maya 会自动加载。没启动过的 Maya 版本，以及同一台电脑上的其他 Windows 用户，会在第一次启动时自动开启。
 - 每次运行都会保存日志，在 `%LOCALAPPDATA%\MayaShield-Logs`（保留最近 10 份）。安装遇到问题时，把日志发给作者即可。
@@ -20,13 +21,13 @@
 批量部署可以用静默模式：
 
 ```
-MayaShield-4.1.0-Setup.exe --silent [--scope machine|user] [--versions 2024,2025] [--log install.log] [--lang zh|en]
-MayaShield-4.1.0-Setup.exe --uninstall --silent
+MayaShield-4.1.1-Setup.exe --silent [--scope machine|user] [--versions 2024,2025] [--log install.log] [--lang zh|en]
+MayaShield-4.1.1-Setup.exe --uninstall --silent
 ```
 
-退出码：`0` 成功，`1` 出错（详情见日志），`2` 没找到 Maya，`3` Maya 正在运行，`4` 拒绝了管理员确认，`5` 旧版需要管理员权限才能替换，`6` 已安装但安装后的检查没有通过，`7` 另一个安装程序正在运行。
+退出码：`0` 成功，`1` 出错（详情见日志），`2` 没找到 Maya，`3` Maya 正在运行（日志里会写明是哪个进程；加 `--force` 可以跳过这项检查），`4` 拒绝了管理员确认，`5` 旧版需要管理员权限才能替换，`6` 已安装但安装后的检查没有通过，`7` 另一个安装程序正在运行。
 
-**macOS / Linux / 手动安装：** 把 `dist/MayaShield-4.1.0-module.zip` 解压到 `<Maya 用户目录>/<版本>/modules/`，启动时会自动开启 autoload。这种方式没有在 macOS 和 Linux 上实测过。
+**macOS / Linux / 手动安装：** 把 `dist/MayaShield-4.1.1-module.zip` 解压到 `<Maya 用户目录>/<版本>/modules/`，启动时会自动开启 autoload。这种方式没有在 macOS 和 Linux 上实测过。
 
 ## 使用
 

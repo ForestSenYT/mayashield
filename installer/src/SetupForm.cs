@@ -401,15 +401,40 @@ namespace MayaShieldSetup
             Run(true, () => engine.Uninstall(Maya.WithModule(o)));
         }
 
+        /// <summary>
+        /// Waits for the user to close Maya.  The message names what was found, and always
+        /// leaves a way on: a check that is wrong must never be a dead end.
+        /// </summary>
         bool MayaClosed()
         {
-            while (!o.Force && Maya.IsRunning())
+            while (!o.Force)
             {
-                if (MessageBox.Show(this, L.T("mayaRunning"), Text, MessageBoxButtons.RetryCancel, MessageBoxIcon.Warning) != DialogResult.Retry)
+                List<MayaProcess> blocking = Maya.Blocking(o, report);
+                if (blocking.Count == 0)
+                    break;
+                string found = string.Join("\n", blocking.Select(process => "    " + process.Describe()));
+                int answer = NativeMessageBox(Handle, L.T("mayaRunning", found), Text,
+                                              MB_CANCELTRYCONTINUE | MB_ICONWARNING | MB_DEFBUTTON2);
+                if (answer == IDCONTINUE)
+                {
+                    report.Log(L.T("mayaRunningIgnored"));
+                    break;
+                }
+                if (answer != IDTRYAGAIN)
                     return false;
             }
             return true;
         }
+
+        // Cancel / Try Again / Continue: Windows has the buttons, Windows Forms of .NET 4 has no name for them.
+        const uint MB_CANCELTRYCONTINUE = 0x6;
+        const uint MB_ICONWARNING = 0x30;
+        const uint MB_DEFBUTTON2 = 0x100;
+        const int IDTRYAGAIN = 10;
+        const int IDCONTINUE = 11;
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "MessageBoxW")]
+        static extern int NativeMessageBox(IntPtr owner, string text, string caption, uint type);
 
         void Run(bool uninstall, Func<int> work)
         {

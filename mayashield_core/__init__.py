@@ -10,6 +10,6 @@ Language level: must stay valid on Python 3.7 (Maya 2022) through 3.13
 (Maya 2027), so no walrus, no positional-only arguments, no ``match``.
 """
 
-__version__ = "4.1.0"
+__version__ = "4.1.1"
 VENDOR = "4rest"
 PLUGIN_NAME = "mayashield"
